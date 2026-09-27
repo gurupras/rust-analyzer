@@ -329,13 +329,40 @@ fn compute_symbol_info(
     scip_types::SymbolInformation {
         symbol,
         documentation,
-        relationships: Vec::new(),
+        relationships: implementation_relationships(token),
         special_fields: Default::default(),
         kind: symbol_kind(token.kind).into(),
         display_name: token.display_name.clone().unwrap_or_default(),
         signature_documentation: signature_documentation.into(),
         enclosing_symbol: enclosing_symbol.unwrap_or_default(),
     }
+}
+
+/// `is_implementation` relationships from `TokenStaticData::implements`,
+/// sorted and deduplicated so the output is deterministic (`Ord for String` is
+/// bytewise, so the order is locale-independent). A local moniker cannot be a
+/// cross-document relationship target and is skipped.
+fn implementation_relationships(token: &TokenStaticData) -> Vec<scip_types::Relationship> {
+    let mut symbols: Vec<String> = token
+        .implements
+        .iter()
+        .filter_map(|m| match m {
+            MonikerResult::Moniker(moniker) => {
+                Some(scip::symbol::format_symbol(moniker_to_symbol(moniker)))
+            }
+            MonikerResult::Local { .. } => None,
+        })
+        .collect();
+    symbols.sort();
+    symbols.dedup();
+    symbols
+        .into_iter()
+        .map(|symbol| scip_types::Relationship {
+            symbol,
+            is_implementation: true,
+            ..Default::default()
+        })
+        .collect()
 }
 
 fn get_relative_filepath(
@@ -585,6 +612,108 @@ mod test {
 
         assert!(found_symbol.is_some(), "must have one symbol {found_symbol:?}");
         assert_eq!(found_symbol.unwrap(), expected);
+    }
+
+    /// The sorted `is_implementation` targets of the token at the cursor.
+    fn check_relationships(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected: &[&str]) {
+        let (host, position) = position(ra_fixture);
+        let analysis = host.analysis();
+        let si = StaticIndex::compute(
+            &analysis,
+            VendoredLibrariesConfig::Included {
+                workspace_root: &VfsPath::new_virtual_path("/workspace".to_owned()),
+            },
+        );
+        let FilePosition { file_id, offset } = position;
+        let mut found: Option<Vec<String>> = None;
+        for file in &si.files {
+            if file.file_id != file_id {
+                continue;
+            }
+            for &(range, id) in &file.tokens {
+                if range.start() != TextSize::from(0) && range.contains(offset - TextSize::from(1))
+                {
+                    let token = si.tokens.get(id).unwrap();
+                    found = Some(
+                        implementation_relationships(token)
+                            .into_iter()
+                            .inspect(|r| assert!(r.is_implementation))
+                            .map(|r| r.symbol)
+                            .collect(),
+                    );
+                    break;
+                }
+            }
+        }
+        let found = found.expect("no token at the cursor");
+        assert_eq!(found, expected.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn relationships_adt_with_trait_impl() {
+        check_relationships(
+            r#"
+//- /foo/lib.rs crate:foo@0.1.0,https://a.b/foo.git library
+pub trait Area { fn area(&self) -> u32; }
+pub trait Named {}
+pub struct Square$0;
+impl Area for Square { fn area(&self) -> u32 { 1 } }
+impl Named for Square {}
+"#,
+            &["rust-analyzer cargo foo 0.1.0 Area#", "rust-analyzer cargo foo 0.1.0 Named#"],
+        );
+    }
+
+    #[test]
+    fn relationships_trait_impl_method() {
+        check_relationships(
+            r#"
+//- /foo/lib.rs crate:foo@0.1.0,https://a.b/foo.git library
+pub trait Area { fn area(&self) -> u32; }
+pub struct Square;
+impl Area for Square { fn area$0(&self) -> u32 { 1 } }
+"#,
+            &["rust-analyzer cargo foo 0.1.0 Area#area()."],
+        );
+    }
+
+    #[test]
+    fn relationships_no_blanket_impl_on_adt() {
+        // Pins the absence: all_for_type returns non-blanket impls only. If
+        // that ever widens, every ADT would gain an edge to every blanket trait.
+        check_relationships(
+            r#"
+//- /foo/lib.rs crate:foo@0.1.0,https://a.b/foo.git library
+pub trait Describe { fn describe(&self) -> u32; }
+impl<T> Describe for T { fn describe(&self) -> u32 { 0 } }
+pub struct Plain$0;
+"#,
+            &[],
+        );
+    }
+
+    #[test]
+    fn relationships_blanket_impl_method() {
+        check_relationships(
+            r#"
+//- /foo/lib.rs crate:foo@0.1.0,https://a.b/foo.git library
+pub trait Describe { fn describe(&self) -> u32; }
+impl<T> Describe for T { fn describe$0(&self) -> u32 { 0 } }
+"#,
+            &["rust-analyzer cargo foo 0.1.0 Describe#describe()."],
+        );
+    }
+
+    #[test]
+    fn relationships_inherent_impl_has_none() {
+        check_relationships(
+            r#"
+//- /foo/lib.rs crate:foo@0.1.0,https://a.b/foo.git library
+pub struct Square;
+impl Square { pub fn side$0(&self) -> u32 { 1 } }
+"#,
+            &[],
+        );
     }
 
     #[test]

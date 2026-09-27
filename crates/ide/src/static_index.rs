@@ -72,6 +72,18 @@ pub struct TokenStaticData {
     pub definition_body: Option<FileRange>,
     pub references: Vec<ReferenceData>,
     pub moniker: Option<MonikerResult>,
+    /// Monikers of what this definition implements, emitted as SCIP
+    /// `is_implementation` relationships:
+    /// - for an ADT, the trait of each impl `hir::Impl::all_for_type` returns.
+    ///   That query reads the non-blanket impls keyed by the self type only
+    ///   (`TraitImpls::for_self_ty`), so blanket impls (`impl<T: X> Y for T`)
+    ///   never appear here; a test pins that, because widening the query would
+    ///   otherwise attach every blanket trait to every ADT;
+    /// - for a method of a trait impl (blanket impls included), the trait's
+    ///   method of the same name.
+    /// Associated consts and types of trait impls get no edge, and inherent
+    /// impls produce none. LSIF ignores this field.
+    pub implements: Vec<MonikerResult>,
     pub display_name: Option<String>,
     pub signature: Option<String>,
     pub kind: SymbolInformationKind,
@@ -127,6 +139,37 @@ fn all_modules(db: &dyn HirDatabase) -> Vec<Module> {
     }
 
     modules
+}
+
+/// What `def` implements, as monikers (see `TokenStaticData::implements`).
+fn implemented_monikers(
+    db: &RootDatabase,
+    def: Definition<'_>,
+    krate: hir::Crate,
+) -> Vec<MonikerResult> {
+    use hir::AsAssocItem;
+    let targets: Vec<Definition<'_>> = match def {
+        Definition::Adt(adt) => hir::Impl::all_for_type(db, adt.ty(db))
+            .into_iter()
+            .filter_map(|imp| imp.trait_(db))
+            .map(Definition::Trait)
+            .collect(),
+        Definition::Function(func) => match func.as_assoc_item(db).map(|it| it.container(db)) {
+            Some(hir::AssocItemContainer::Impl(imp)) => match (imp.trait_(db), func.name(db)) {
+                (Some(trait_), name) => trait_
+                    .items(db)
+                    .into_iter()
+                    .filter_map(|it| it.as_function())
+                    .filter(|f| f.name(db) == name)
+                    .map(Definition::Function)
+                    .collect(),
+                _ => vec![],
+            },
+            _ => vec![],
+        },
+        _ => vec![],
+    };
+    targets.into_iter().filter_map(|t| def_to_moniker(db, t, krate)).collect()
 }
 
 fn documentation_for_definition(
@@ -224,6 +267,9 @@ impl<'a> StaticIndex<'a> {
                     }),
                     references: vec![],
                     moniker: current_crate.and_then(|cc| def_to_moniker(self.db, def, cc)),
+                    implements: current_crate
+                        .map(|cc| implemented_monikers(self.db, def, cc))
+                        .unwrap_or_default(),
                     display_name: def
                         .name(self.db)
                         .map(|name| name.display(self.db, edition).to_string()),
