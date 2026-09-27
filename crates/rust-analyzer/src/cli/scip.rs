@@ -720,6 +720,55 @@ pub struct Plain$0;
     }
 
     #[test]
+    fn blanket_method_from_dependency_applies_to_plain() {
+        // The companion of relationships_no_blanket_impl_on_adt_from_dependency:
+        // dep's blanket impl DOES apply to Plain across the edge (the call
+        // resolves to the impl's method), so the absence of a type-level
+        // Describe edge there is an absence of an edge, not of an applicable
+        // impl.
+        check_symbol(
+            r#"
+//- /dep/lib.rs crate:dep@0.1.0,https://a.b/dep.git library
+pub trait Describe { fn describe(&self) -> u32; }
+pub trait Other {}
+impl<T> Describe for T { fn describe(&self) -> u32 { 0 } }
+//- /foo/lib.rs crate:foo@0.1.0,https://a.b/foo.git deps:dep library
+use dep::Describe;
+pub trait Real {}
+impl Real for Plain {}
+impl dep::Other for Plain {}
+pub struct Plain;
+pub fn f(r: Plain) -> u32 { r.describe$0() }
+"#,
+            "rust-analyzer cargo dep 0.1.0 impl#[T][Describe]describe().",
+        );
+    }
+
+    #[test]
+    fn blanket_method_from_dependency_needs_the_edge() {
+        // Without `deps:dep` the same call resolves to nothing: the resolution
+        // above goes through the dependency edge. check_symbol cannot tell "no
+        // token at the cursor" from "a token without a moniker", so this pins
+        // that the edge is load-bearing, not which of the two happens without it.
+        check_symbol(
+            r#"
+//- /dep/lib.rs crate:dep@0.1.0,https://a.b/dep.git library
+pub trait Describe { fn describe(&self) -> u32; }
+pub trait Other {}
+impl<T> Describe for T { fn describe(&self) -> u32 { 0 } }
+//- /foo/lib.rs crate:foo@0.1.0,https://a.b/foo.git library
+use dep::Describe;
+pub trait Real {}
+impl Real for Plain {}
+impl dep::Other for Plain {}
+pub struct Plain;
+pub fn f(r: Plain) -> u32 { r.describe$0() }
+"#,
+            "",
+        );
+    }
+
+    #[test]
     fn relationships_blanket_impl_method() {
         check_relationships(
             r#"
