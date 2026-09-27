@@ -681,14 +681,36 @@ impl Area for Square { fn area$0(&self) -> u32 { 1 } }
     fn relationships_no_blanket_impl_on_adt() {
         // Pins the absence: all_for_type returns non-blanket impls only. If
         // that ever widens, every ADT would gain an edge to every blanket trait.
+        // `Real` is a positive control: the test cannot pass unless the cursor
+        // really is on `Plain` (an empty list on the wrong token would).
         check_relationships(
             r#"
 //- /foo/lib.rs crate:foo@0.1.0,https://a.b/foo.git library
 pub trait Describe { fn describe(&self) -> u32; }
+pub trait Real {}
 impl<T> Describe for T { fn describe(&self) -> u32 { 0 } }
+impl Real for Plain {}
 pub struct Plain$0;
 "#,
-            &[],
+            &["rust-analyzer cargo foo 0.1.0 Real#"],
+        );
+    }
+
+    #[test]
+    fn relationships_no_blanket_impl_on_adt_from_dependency() {
+        // The same pin across crates: a blanket impl in a dependency, which is
+        // the dependency-graph fan-out the absence protects against.
+        check_relationships(
+            r#"
+//- /dep/lib.rs crate:dep@0.1.0,https://a.b/dep.git library
+pub trait Describe { fn describe(&self) -> u32; }
+impl<T> Describe for T { fn describe(&self) -> u32 { 0 } }
+//- /foo/lib.rs crate:foo@0.1.0,https://a.b/foo.git deps:dep library
+pub trait Real {}
+impl Real for Plain {}
+pub struct Plain$0;
+"#,
+            &["rust-analyzer cargo foo 0.1.0 Real#"],
         );
     }
 
