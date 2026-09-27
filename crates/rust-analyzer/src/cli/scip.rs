@@ -700,17 +700,22 @@ pub struct Plain$0;
     fn relationships_no_blanket_impl_on_adt_from_dependency() {
         // The same pin across crates: a blanket impl in a dependency, which is
         // the dependency-graph fan-out the absence protects against.
+        // `dep::Other` is a control for the dependency edge: it resolves only
+        // through `deps:dep`, so a fixture whose edge is missing cannot pass,
+        // and the absence of `Describe` is then an absence across a live edge.
         check_relationships(
             r#"
 //- /dep/lib.rs crate:dep@0.1.0,https://a.b/dep.git library
 pub trait Describe { fn describe(&self) -> u32; }
+pub trait Other {}
 impl<T> Describe for T { fn describe(&self) -> u32 { 0 } }
 //- /foo/lib.rs crate:foo@0.1.0,https://a.b/foo.git deps:dep library
 pub trait Real {}
 impl Real for Plain {}
+impl dep::Other for Plain {}
 pub struct Plain$0;
 "#,
-            &["rust-analyzer cargo foo 0.1.0 Real#"],
+            &["rust-analyzer cargo dep 0.1.0 Other#", "rust-analyzer cargo foo 0.1.0 Real#"],
         );
     }
 
