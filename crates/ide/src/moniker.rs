@@ -11,7 +11,7 @@ use ide_db::{
     helpers::pick_best_token,
 };
 use itertools::Itertools;
-use syntax::{AstNode, SyntaxKind::*, T};
+use syntax::{AstNode, SyntaxKind::*, T, ast, ast::HasName};
 
 use crate::{RangeInfo, doc_links::token_as_doc_comment, parent_module::crates_for};
 
@@ -333,6 +333,25 @@ fn def_to_non_local_moniker(
                                 });
                             }
                         }
+                        // The only other nameless module is a *block* module: the module introduced
+                        // by a `{ ... }` that contains items, i.e. the body of a function, const or
+                        // static. It contributed no descriptor at all, so an item defined inside a
+                        // function body was named as though it sat at module level, and
+                        // `fn a() { struct S; }` and `fn b() { struct S; }` in one module computed
+                        // ONE symbol string for two distinct types.
+                        //
+                        // This arm is where the function has to name itself, and it is the only
+                        // place it can: `Definition::enclosing_definition` maps a fn-local item to
+                        // its block module, and the block module's `containing_module` skips the
+                        // function outright, so the loop below never visits the function.
+                        Definition::Module(module) => {
+                            if !push_block_owner_descriptor(db, module, &mut reverse_description) {
+                                tracing::error!(
+                                    ?def,
+                                    "Encountered enclosing definition with no name"
+                                );
+                            }
+                        }
                         _ => {
                             tracing::error!(?def, "Encountered enclosing definition with no name");
                         }
@@ -384,6 +403,71 @@ fn def_to_non_local_moniker(
             PackageInformation { name: name.as_str().to_owned(), repo, version }
         },
     })
+}
+
+/// If `module` is a block module, push a descriptor naming the item that OWNS the body the block sits
+/// in, so an item defined inside a function body carries that function in its identity. Returns
+/// whether `module` was a block module at all; `false` means the caller's own diagnostic still
+/// applies. Returning `true` having pushed nothing is normal and is not a failure: see `Const` below.
+///
+/// The route is syntactic on purpose. There is no hir route from a block module to the function that
+/// owns it -- `ModuleId::containing_module` does not go there and there is no `owning_definition` --
+/// but a block module's definition source IS the `BlockExpr`, and reading a name off the syntax tree
+/// needs no name resolution and no `Semantics`.
+///
+/// WHICH ancestor is the load-bearing decision, and it follows from what `containing_module` actually
+/// returns for a block module. `BlockId` records the module passed to the body lowerer, which is the
+/// module the body's OWNER lives in, and it is the same for every block in one body
+/// (`expr_store::lower::collect_block_`). So:
+///
+///   * the caller's loop DOES walk item nesting: from `fn outer() { fn inner() { .. } }`, `inner`'s
+///     body block leads to `outer`'s body block, which names `outer`. Walking every ancestor here as
+///     well produced `outer().outer().inner().S#`.
+///   * the caller's loop does NOT walk block nesting: from `fn func() { { struct Helper; } }`, the
+///     bare block leads straight to the crate root, skipping `func`'s body block. Taking only the
+///     block's immediate parent here produced a bare `Helper#`, with no `func()` at all -- worse
+///     than before the change, since it can now collide with a module-level `Helper`.
+///
+/// Both of those were observed, not predicted. Stopping at the FIRST `Item` ancestor is what
+/// satisfies them together: it names exactly the owner of the body, which is the one thing the
+/// caller's own walk cannot see, and nothing the caller will name again.
+fn push_block_owner_descriptor(
+    db: &RootDatabase,
+    module: hir::Module,
+    reverse_description: &mut Vec<MonikerDescriptor>,
+) -> bool {
+    let hir::ModuleSource::BlockExpr(block) = module.definition_source(db).value else {
+        return false;
+    };
+    for node in block.syntax().ancestors().skip(1) {
+        let Some(item) = ast::Item::cast(node) else { continue };
+        let (name, desc) = match &item {
+            ast::Item::Fn(it) => (it.name(), MonikerDescriptorKind::Method),
+            // `const _: () = { .. }` -- the shape derive macros emit -- has an `_` token where the
+            // name goes, so `name()` is `None` and items inside it stay ambiguous. Deliberate: the
+            // only alternative is a positional index, which is not stable across edits, so
+            // inserting one `const _` above another would churn every symbol below it.
+            ast::Item::Const(it) => (it.name(), MonikerDescriptorKind::Term),
+            ast::Item::Static(it) => (it.name(), MonikerDescriptorKind::Term),
+            // Reached by a block in a type position, e.g. an array length in a field.
+            ast::Item::Struct(it) => (it.name(), MonikerDescriptorKind::Type),
+            ast::Item::Enum(it) => (it.name(), MonikerDescriptorKind::Type),
+            ast::Item::Union(it) => (it.name(), MonikerDescriptorKind::Type),
+            ast::Item::Trait(it) => (it.name(), MonikerDescriptorKind::Type),
+            ast::Item::TypeAlias(it) => (it.name(), MonikerDescriptorKind::Type),
+            // An `impl` or a `macro_rules!` has no name to contribute. The walk still STOPS: going
+            // past it would name an item the caller reaches on its own. An `impl`'s self type is
+            // rendered from hir by the `Definition::SelfType` arm, not from syntax, and spelling it
+            // a second way here would not match. Residual: a fn-local item in `impl A { fn m() }`
+            // and in `impl B { fn m() }` still collide -- they are both `m().Item`.
+            _ => break,
+        };
+        if let Some(name) = name {
+            reverse_description.push(MonikerDescriptor { name: name.text().to_string(), desc });
+        }
+        break;
+    }
+    true
 }
 
 fn display<'db, T: HirDisplay<'db>>(db: &'db RootDatabase, module: hir::Module, it: T) -> String {

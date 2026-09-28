@@ -1039,7 +1039,17 @@ pub mod example_mod {
         );
     }
 
-    // FIXME: This test represents current misbehavior.
+    // These four used to be marked `// FIXME: This test represents current misbehavior` and to
+    // expect the bare module-level symbol, with the suggested repair being to make these items
+    // *locals* (`local enclosed by ... func().`). This fork took the other repair: the enclosing
+    // function becomes part of the descriptor, so the item keeps a global symbol and that symbol is
+    // unique. The reason is the relationship plane, which is why this fork exists: a fn-local type
+    // can implement a trait, and `local` symbols are document-scoped, so an `is_implementation`
+    // edge out of one is not joinable across documents and drops out of the graph. A qualified
+    // global symbol keeps the edge and still disambiguates.
+    //
+    // The two repairs close the same collisions; they differ only in whether the edge survives. If
+    // upstream ever makes these locals, these expectations are the ones to revisit.
     #[test]
     fn symbol_for_nested_function() {
         check_symbol(
@@ -1049,13 +1059,10 @@ pub mod example_mod {
        pub fn inner_func$0() {}
     }
     "#,
-            "rust-analyzer cargo main . inner_func().",
-            // FIXME: This should be a local:
-            // "local enclosed by rust-analyzer cargo main . func().",
+            "rust-analyzer cargo main . func().inner_func().",
         );
     }
 
-    // FIXME: This test represents current misbehavior.
     #[test]
     fn symbol_for_struct_in_function() {
         check_symbol(
@@ -1065,13 +1072,10 @@ pub mod example_mod {
        struct SomeStruct$0 {}
     }
     "#,
-            "rust-analyzer cargo main . SomeStruct#",
-            // FIXME: This should be a local:
-            // "local enclosed by rust-analyzer cargo main . func().",
+            "rust-analyzer cargo main . func().SomeStruct#",
         );
     }
 
-    // FIXME: This test represents current misbehavior.
     #[test]
     fn symbol_for_const_in_function() {
         check_symbol(
@@ -1081,13 +1085,10 @@ pub mod example_mod {
        const SOME_CONST$0: u32 = 1;
     }
     "#,
-            "rust-analyzer cargo main . SOME_CONST.",
-            // FIXME: This should be a local:
-            // "local enclosed by rust-analyzer cargo main . func().",
+            "rust-analyzer cargo main . func().SOME_CONST.",
         );
     }
 
-    // FIXME: This test represents current misbehavior.
     #[test]
     fn symbol_for_static_in_function() {
         check_symbol(
@@ -1097,9 +1098,259 @@ pub mod example_mod {
        static SOME_STATIC$0: u32 = 1;
     }
     "#,
-            "rust-analyzer cargo main . SOME_STATIC.",
-            // FIXME: This should be a local:
-            // "local enclosed by rust-analyzer cargo main . func().",
+            "rust-analyzer cargo main . func().SOME_STATIC.",
+        );
+    }
+
+    /// The defect this fork's descriptor change exists for: two functions in ONE module each
+    /// defining `FieldVisitor` computed ONE symbol string, so a consumer received one record for two
+    /// unrelated types. Both halves of the pair are asserted, because a test that only pins one of
+    /// them passes just as well when the other is the string it collides with.
+    #[test]
+    fn fn_local_structs_of_one_name_in_two_fns_are_distinct_a() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub fn de_a() {
+       struct FieldVisitor$0;
+    }
+    pub fn de_b() {
+       struct FieldVisitor;
+    }
+    "#,
+            "rust-analyzer cargo main . de_a().FieldVisitor#",
+        );
+    }
+
+    #[test]
+    fn fn_local_structs_of_one_name_in_two_fns_are_distinct_b() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub fn de_a() {
+       struct FieldVisitor;
+    }
+    pub fn de_b() {
+       struct FieldVisitor$0;
+    }
+    "#,
+            "rust-analyzer cargo main . de_b().FieldVisitor#",
+        );
+    }
+
+    /// The shape that motivated the fix, from a real corpus: `tokio 1.53.1 DATA.` had 13 definition
+    /// sites, all 13 inside a function body, in 2 documents -- a `const DATA` declared separately in
+    /// thirteen tests. A const in a fn and a struct in two fns are each covered above; this is the
+    /// combination that was actually observed.
+    #[test]
+    fn fn_local_consts_of_one_name_in_two_fns_are_distinct_a() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub fn read_a() {
+       const DATA$0: &[u8] = b"a";
+    }
+    pub fn read_b() {
+       const DATA: &[u8] = b"b";
+    }
+    "#,
+            "rust-analyzer cargo main . read_a().DATA.",
+        );
+    }
+
+    #[test]
+    fn fn_local_consts_of_one_name_in_two_fns_are_distinct_b() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub fn read_a() {
+       const DATA: &[u8] = b"a";
+    }
+    pub fn read_b() {
+       const DATA$0: &[u8] = b"b";
+    }
+    "#,
+            "rust-analyzer cargo main . read_b().DATA.",
+        );
+    }
+
+    /// A reference inside one function must resolve to THAT function's item. Without this, the
+    /// definitions could be distinct while every use still pointed at one of them -- the two are
+    /// separate properties and the first does not imply the second.
+    #[test]
+    fn reference_to_fn_local_struct_resolves_within_its_own_fn() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub fn de_a() {
+       struct FieldVisitor;
+    }
+    pub fn de_b() {
+       struct FieldVisitor;
+       let _v = FieldVisitor$0;
+    }
+    "#,
+            "rust-analyzer cargo main . de_b().FieldVisitor#",
+        );
+    }
+
+    /// Same name, different item kinds, in two functions. The kind suffix (`#` for both a struct and
+    /// an enum) does not separate these, so the function descriptor is doing the whole job.
+    #[test]
+    fn fn_local_struct_and_enum_of_one_name_are_distinct() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub fn de_a() {
+       struct Repr;
+    }
+    pub fn de_b() {
+       enum Repr$0 {}
+    }
+    "#,
+            "rust-analyzer cargo main . de_b().Repr#",
+        );
+    }
+
+    /// An item in a `const`/`static` initializer block, which is also a block module. `const _` has
+    /// no name, so that shape is NOT disambiguated -- see `fn_local_item_in_anonymous_const_is_not_disambiguated`.
+    #[test]
+    fn symbol_for_struct_in_named_const_initializer() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub const TABLE: u8 = {
+       struct Helper$0;
+       0
+    };
+    "#,
+            "rust-analyzer cargo main . TABLE.Helper#",
+        );
+    }
+
+    /// A KNOWN RESIDUAL, asserted so it is a recorded limitation rather than a surprise: `const _`
+    /// contributes no name, so two items of one name in two anonymous consts still collide. This is
+    /// the shape derive macros emit. Naming them by position would be worse -- a positional index is
+    /// not stable across edits, so every symbol below an insertion would churn.
+    #[test]
+    fn fn_local_item_in_anonymous_const_is_not_disambiguated() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    const _: () = {
+       struct Helper$0;
+    };
+    "#,
+            "rust-analyzer cargo main . Helper#",
+        );
+    }
+
+    /// A bare `{ .. }` used as a statement is a block module too, and its own parent is not an item.
+    /// This is the test that decided the shape of the fix: with the walk stopping at the block's
+    /// immediate parent, this came out as a bare `rust-analyzer cargo main . Helper#` -- no `func()`
+    /// at all, so the item could now collide with a module-level `Helper` -- because
+    /// `containing_module` of the inner block module goes straight to the enclosing non-block module
+    /// and never visits the function's own body block. The walk therefore covers all levels.
+    #[test]
+    fn struct_in_a_bare_block_inside_a_fn_is_qualified_by_the_fn() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub fn func() {
+       { struct Helper$0; }
+    }
+    "#,
+            "rust-analyzer cargo main . func().Helper#",
+        );
+    }
+
+    /// The other half of that decision, and the case that rules out simply walking every ancestor:
+    /// here the caller's own module chain DOES reach `outer`'s body block, so a full ancestor walk
+    /// named `outer` twice and produced `outer().outer().inner().S#`. Both this and the bare-block
+    /// test above pass only if the walk stops at the first `Item` ancestor.
+    #[test]
+    fn struct_in_a_fn_in_a_fn_names_both_fns() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub fn outer() {
+       fn inner() {
+           struct S$0;
+       }
+    }
+    "#,
+            "rust-analyzer cargo main . outer().inner().S#",
+        );
+    }
+
+    /// A KNOWN RESIDUAL: two blocks in ONE function. The function name is the only disambiguator, so
+    /// this pair is still ambiguous. Recorded rather than fixed -- positions are not stable across
+    /// edits. The same applies to two closures in one function.
+    #[test]
+    fn two_blocks_in_one_fn_are_not_disambiguated() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub fn func() {
+       { struct Helper$0; }
+       { struct Helper; }
+    }
+    "#,
+            "rust-analyzer cargo main . func().Helper#",
+        );
+    }
+
+    /// A KNOWN RESIDUAL: the walk stops at the function and never reaches the `impl`, so a fn-local
+    /// item under `impl A` and under `impl B` are both `m().Helper#` and still collide. Naming the
+    /// impl would mean spelling its self type from syntax, which would not match the hir-rendered
+    /// form the `SelfType` arm emits elsewhere. Asserted so the hole is a record, not a surprise.
+    #[test]
+    fn fn_local_item_under_an_impl_is_not_qualified_by_the_impl() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub struct A;
+    impl A {
+       pub fn m() {
+           struct Helper$0;
+       }
+    }
+    "#,
+            "rust-analyzer cargo main . m().Helper#",
+        );
+    }
+
+    /// CONTROL. A module-level item must be completely unaffected: if this string changed, the
+    /// descriptor change would be churning symbols it has no business touching, and the measured
+    /// churn figure (serde 16.59% of definition sites) would be wrong in the other direction.
+    #[test]
+    fn module_level_item_symbol_is_unchanged() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub mod m {
+       pub struct Plain$0;
+       pub fn func() {}
+    }
+    "#,
+            "rust-analyzer cargo main . m/Plain#",
+        );
+    }
+
+    /// CONTROL, the other half: an item inside an `impl` inside a module is also untouched. The
+    /// `impl` ancestor is deliberately skipped by the block walk, so an inherent method must keep
+    /// the `impl#[Type]` shape it already had.
+    #[test]
+    fn inherent_method_symbol_is_unchanged() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub struct S;
+    impl S {
+       pub fn m$0(&self) {}
+    }
+    "#,
+            "rust-analyzer cargo main . impl#[S]m().",
         );
     }
 
