@@ -1485,6 +1485,203 @@ pub mod example_mod {
         );
     }
 
+    /// PROBE for a DEFECT found on the tokio pack: 315 definition sites in 38 documents spell their owner
+    /// TWICE (`actor_weak_sender().actor_weak_sender().MyActor#receiver.`). The shape there is
+    /// `#[tokio::test] async fn f() { <item> }`, which expands to a non-async `fn f` whose body holds an
+    /// `async` block holding the item -- a macro, an async block and a fn all at once. These three tests
+    /// separate those causes; each asserts SINGLE naming, so whichever doubles is the one that fails.
+    ///
+    /// This one has no macro: a plain fn containing an `async` block containing the item.
+    #[test]
+    fn fn_local_item_in_an_async_block_names_its_fn_once() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub fn func() {
+       let _ = async { struct Helper$0; };
+    }
+    "#,
+            "rust-analyzer cargo main . func().Helper#",
+        );
+    }
+
+    /// No macro and no block expression: the fn itself is `async`. If the doubling is here, the cause is
+    /// that an async fn's body is reached through two block modules rather than one.
+    #[test]
+    fn fn_local_item_in_an_async_fn_names_its_fn_once() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub async fn func() {
+       struct Helper$0;
+    }
+    "#,
+            "rust-analyzer cargo main . func().Helper#",
+        );
+    }
+
+    /// A KNOWN RESIDUAL, found while writing fixtures for the doubled-owner defect and asserted here so
+    /// that fixing it shows up as a failing test rather than as a silent change. An item inside an
+    /// `async` block that a MACRO generates gets no owner at all -- the bare `Helper#` below is the
+    /// pre-`31ebc2d` symbol, so it can collide with a module-level `Helper`.
+    ///
+    /// The `async` is the whole difference: `item_in_a_macro_generated_block_is_qualified_by_the_enclosing_fn`
+    /// is this fixture with a plain `{ $i }` block and correctly gives `func().Helper#`, and
+    /// `fn_local_item_in_an_async_block_names_its_fn_once` is this fixture without the macro and is also
+    /// correct. Only the combination loses the owner, and the cause is not located yet.
+    ///
+    /// Its incidence on real code is UNMEASURED, and a pack cannot supply it: a symbol with no owner is
+    /// indistinguishable from an item that really is at module level. That is the opposite of the
+    /// doubled-owner defect, which a pack diff could count exactly because the wrong symbols were
+    /// self-evidently wrong.
+    #[test]
+    fn fn_local_item_in_a_macro_generated_async_block_loses_its_owner() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    macro_rules! wrap {
+       ($i:item) => { async { $i } };
+    }
+    pub fn func() {
+       let _ = wrap! { struct Helper$0; };
+    }
+    "#,
+            "rust-analyzer cargo main . Helper#",
+        );
+    }
+
+    /// The tokio shape itself: an ATTRIBUTE macro over the fn, so the expansion contains a copy of the fn
+    /// and the item sits in that copy's body. `#[tokio::test]` does this and also wraps the body in an
+    /// `async` block; `identity` re-emits the item unchanged, which isolates the attribute from the async.
+    #[test]
+    fn fn_local_item_under_an_attribute_macro_names_its_fn_once() {
+        check_symbol(
+            r#"
+    //- proc_macros: identity
+    //- /workspace/lib.rs crate:main
+    #[proc_macros::identity]
+    fn func() {
+       struct Helper$0;
+    }
+    "#,
+            "rust-analyzer cargo main . func().Helper#",
+        );
+    }
+
+    /// The other half of the discriminating pair: the same attribute over an ASYNC fn. If the doubling
+    /// appears here and not above, the async body is part of the cause; if it appears in both, the
+    /// attribute alone is enough.
+    #[test]
+    fn fn_local_item_under_an_attribute_macro_on_an_async_fn_names_its_fn_once() {
+        check_symbol(
+            r#"
+    //- proc_macros: identity
+    //- /workspace/lib.rs crate:main
+    #[proc_macros::identity]
+    async fn func() {
+       struct Helper$0;
+    }
+    "#,
+            "rust-analyzer cargo main . func().Helper#",
+        );
+    }
+
+    /// The full tokio shape, assembled from a `macro_rules!` because the builtin fixture proc macros
+    /// cannot rewrite a body: the expansion contains the FN, an `async` block inside it, and the caller's
+    /// item inside that. `#[tokio::test] async fn f() { <item> }` expands to exactly this.
+    #[test]
+    fn fn_local_item_in_a_generated_fn_with_an_async_body_names_its_fn_once() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    macro_rules! tokio_test {
+       ($n:ident, $($b:tt)*) => {
+           fn $n() { let body = async { $($b)* }; }
+       };
+    }
+    tokio_test!(func, struct Helper$0;);
+    "#,
+            "rust-analyzer cargo main . func().Helper#",
+        );
+    }
+
+    /// Same shape with the generated fn's body holding the item directly, no async block, so the async is
+    /// the only difference from the test above.
+    #[test]
+    fn fn_local_item_in_a_generated_fn_names_its_fn_once() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    macro_rules! plain_test {
+       ($n:ident, $($b:tt)*) => {
+           fn $n() { $($b)* }
+       };
+    }
+    plain_test!(func, struct Helper$0;);
+    "#,
+            "rust-analyzer cargo main . func().Helper#",
+        );
+    }
+
+    /// THE DEFECT, minimised from `tokio/benches/rt_multi_threaded.rs:105`, where
+    /// `rt_multi_spawn_many_remote_busy2().rt_multi_spawn_many_remote_busy2().iter().` was emitted: 315
+    /// definition sites in 38 tokio documents named their owner TWICE. It needs no macro and no `async` --
+    /// only TWO NESTED BLOCK MODULES OVER ONE OWNER, which is what the `const` below buys. Without it the
+    /// fn's body holds no item, so it is not a block module at all and the inner block's parent is the
+    /// crate root (see `struct_in_a_bare_block_inside_a_fn_is_qualified_by_the_fn`); with it the chain is
+    /// inner block -> fn body block -> crate root, the caller visits BOTH block modules, and each visit
+    /// ran this walk from scratch and named `func` again.
+    #[test]
+    fn fn_local_item_in_a_nested_block_names_its_fn_once() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub fn func() {
+       const C: u8 = 0;
+       { struct Helper$0; }
+    }
+    "#,
+            "rust-analyzer cargo main . func().Helper#",
+        );
+    }
+
+    /// The other direction of the same fix, and the reason it dedupes by DEFINITION rather than by the
+    /// rendered name: here the two owners are spelled identically and are two different functions, so the
+    /// repetition is correct and must survive. A name-based guard would emit `f().S#` and put this item in
+    /// the same symbol as an `S` in the outer `f`'s own body.
+    #[test]
+    fn fn_local_item_in_a_shadowing_fn_names_both_fns() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub fn f() {
+       fn f() {
+           struct S$0;
+       }
+    }
+    "#,
+            "rust-analyzer cargo main . f().f().S#",
+        );
+    }
+
+    /// Both nesting levels of that shadowing pair, since asserting one alone would pass if the other
+    /// collapsed onto it -- which is exactly what a name-based dedupe would do.
+    #[test]
+    fn fn_local_item_in_the_outer_of_two_shadowing_fns_is_distinct() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub fn f() {
+       struct S$0;
+       fn f() {
+           struct S;
+       }
+    }
+    "#,
+            "rust-analyzer cargo main . f().S#",
+        );
+    }
+
     /// Two integration-test targets of ONE package, each defining `Data`. The symbol's package field
     /// is the package name for both and nothing else named the target, so both computed
     /// `... serde_test_suite 0.0.0 Data#`. On serde this class was 103 of 196 colliding symbols; the

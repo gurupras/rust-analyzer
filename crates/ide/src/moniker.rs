@@ -119,9 +119,9 @@ pub enum MonikerResult {
 }
 
 impl MonikerResult {
-    pub fn from_def(
-        sema: &Semantics<'_, RootDatabase>,
-        def: Definition<'_>,
+    pub fn from_def<'db>(
+        sema: &Semantics<'db, RootDatabase>,
+        def: Definition<'db>,
         from_crate: Crate,
     ) -> Option<Self> {
         def_to_moniker(sema, def, from_crate)
@@ -263,9 +263,9 @@ pub(crate) fn def_to_kind(db: &RootDatabase, def: Definition<'_>) -> SymbolInfor
 ///   `BuiltinLifetime`, `TupleField`, `ToolModule`, and `InlineAsmRegOrRegClass`. TODO: it might be
 ///   sensible to provide monikers that refer to some non-existent crate of compiler builtin
 ///   definitions.
-pub(crate) fn def_to_moniker(
-    sema: &Semantics<'_, RootDatabase>,
-    definition: Definition<'_>,
+pub(crate) fn def_to_moniker<'db>(
+    sema: &Semantics<'db, RootDatabase>,
+    definition: Definition<'db>,
     from_crate: Crate,
 ) -> Option<MonikerResult> {
     match definition {
@@ -279,9 +279,9 @@ pub(crate) fn def_to_moniker(
     Some(MonikerResult::Moniker(def_to_non_local_moniker(sema, definition, from_crate)?))
 }
 
-fn enclosing_def_to_moniker(
-    sema: &Semantics<'_, RootDatabase>,
-    mut def: Definition<'_>,
+fn enclosing_def_to_moniker<'db>(
+    sema: &Semantics<'db, RootDatabase>,
+    mut def: Definition<'db>,
     from_crate: Crate,
 ) -> Option<Moniker> {
     loop {
@@ -293,9 +293,9 @@ fn enclosing_def_to_moniker(
     }
 }
 
-fn def_to_non_local_moniker(
-    sema: &Semantics<'_, RootDatabase>,
-    definition: Definition<'_>,
+fn def_to_non_local_moniker<'db>(
+    sema: &Semantics<'db, RootDatabase>,
+    definition: Definition<'db>,
     from_crate: Crate,
 ) -> Option<Moniker> {
     let db = sema.db;
@@ -316,6 +316,10 @@ fn def_to_non_local_moniker(
 
     // Add descriptors for this definition and every enclosing definition.
     let mut reverse_description = vec![];
+    // The body owners already named for this symbol. The loop below visits every block module in the
+    // chain and two nested block modules can belong to ONE body, so without this an owner is named
+    // once per visit. Definitions, not names: two nested functions of one name are two owners.
+    let mut named_owners: Vec<Definition<'db>> = vec![];
     let mut def = definition;
     loop {
         match def {
@@ -377,6 +381,7 @@ fn def_to_non_local_moniker(
                                 module,
                                 edition,
                                 &mut reverse_description,
+                                &mut named_owners,
                             ) {
                                 tracing::error!(
                                     ?def,
@@ -552,11 +557,25 @@ fn non_lib_target_name(db: &RootDatabase, krate: Crate) -> Option<String> {
 ///
 /// The first two were observed, not predicted. Stopping at the SECOND body owner is what satisfies
 /// them together with the third: the second owner is exactly the one the caller's own loop reaches.
-fn push_block_owner_descriptor(
-    sema: &Semantics<'_, RootDatabase>,
+///
+/// STOPPING AT THE SECOND BODY OWNER IS NOT ENOUGH, because that counts only within ONE call. The
+/// caller visits every block module in the chain and calls this once per module, and two nested block
+/// modules can have the SAME owner: `fn f() { const C: u8 = 0; { struct S; } }` makes the fn body a
+/// block module (it holds `C`) and the inner block another, so `f` was named once per visit and the
+/// item came out as `f().f().S#`. That was 315 definition sites in 38 tokio documents, found by
+/// diffing two packs rather than by any test. `named_owners` carries the owners already named for
+/// this symbol, so the second visit contributes nothing.
+///
+/// It records DEFINITIONS, not rendered names: `fn f() { fn f() { struct S; } }` is two different
+/// functions spelled the same, `f().f().S#` is the correct symbol for its `S`, and a name-based guard
+/// would merge it with an `S` in the outer `f`'s own body -- reintroducing exactly the collision this
+/// walk exists to remove.
+fn push_block_owner_descriptor<'db>(
+    sema: &Semantics<'db, RootDatabase>,
     module: hir::Module,
     edition: Edition,
     reverse_description: &mut Vec<MonikerDescriptor>,
+    named_owners: &mut Vec<Definition<'db>>,
 ) -> bool {
     let db = sema.db;
     let source = module.definition_source(db);
@@ -578,7 +597,16 @@ fn push_block_owner_descriptor(
         // enum above it is not reached by the caller either.
         if let Some(variant) = ast::Variant::cast(node.clone()) {
             named_body_owner = true;
-            push_owner_descriptor(sema, edition, variant.name(), reverse_description, &mut pushed);
+            if !push_owner_descriptor(
+                sema,
+                edition,
+                variant.name(),
+                reverse_description,
+                &mut pushed,
+                named_owners,
+            ) {
+                break;
+            }
             continue;
         }
         let Some(item) = ast::Item::cast(node) else { continue };
@@ -601,21 +629,49 @@ fn push_block_owner_descriptor(
             // Also reached from a type position, but none of these can be an associated item, so
             // nothing above one belongs in this descriptor: name it and stop.
             ast::Item::Struct(it) => {
-                push_owner_descriptor(sema, edition, it.name(), reverse_description, &mut pushed);
+                push_owner_descriptor(
+                    sema,
+                    edition,
+                    it.name(),
+                    reverse_description,
+                    &mut pushed,
+                    named_owners,
+                );
                 break;
             }
             ast::Item::Enum(it) => {
-                push_owner_descriptor(sema, edition, it.name(), reverse_description, &mut pushed);
+                push_owner_descriptor(
+                    sema,
+                    edition,
+                    it.name(),
+                    reverse_description,
+                    &mut pushed,
+                    named_owners,
+                );
                 break;
             }
             ast::Item::Union(it) => {
-                push_owner_descriptor(sema, edition, it.name(), reverse_description, &mut pushed);
+                push_owner_descriptor(
+                    sema,
+                    edition,
+                    it.name(),
+                    reverse_description,
+                    &mut pushed,
+                    named_owners,
+                );
                 break;
             }
             // The two containers of associated items. Naming one is the last thing this walk does:
             // above a `trait` or `impl` there is only a module the caller reaches itself.
             ast::Item::Trait(it) => {
-                push_owner_descriptor(sema, edition, it.name(), reverse_description, &mut pushed);
+                push_owner_descriptor(
+                    sema,
+                    edition,
+                    it.name(),
+                    reverse_description,
+                    &mut pushed,
+                    named_owners,
+                );
                 break;
             }
             ast::Item::Impl(it) => {
@@ -623,7 +679,11 @@ fn push_block_owner_descriptor(
                 // spells it -- same renderer, same order, same descriptor kinds -- so that a
                 // fn-local item under an impl and the impl's own symbol agree on the impl.
                 match sema.to_def(it) {
+                    // An impl is an owner like any other, so it is deduped like any other: without
+                    // this, a chain that named the impl's method twice named the impl twice too.
+                    Some(impl_) if named_owners.contains(&Definition::SelfType(impl_)) => break,
                     Some(impl_) => {
+                        named_owners.push(Definition::SelfType(impl_));
                         if let Some(trait_ref) = impl_.trait_ref(db) {
                             reverse_description.push(MonikerDescriptor {
                                 name: display(db, module, trait_ref),
@@ -652,7 +712,18 @@ fn push_block_owner_descriptor(
             break;
         }
         named_body_owner = true;
-        push_owner_descriptor(sema, edition, name, reverse_description, &mut pushed);
+        if !push_owner_descriptor(
+            sema,
+            edition,
+            name,
+            reverse_description,
+            &mut pushed,
+            named_owners,
+        ) {
+            // Already named, by an earlier visit to a block module of the same body: everything this
+            // walk would push from here up is a repeat of what that visit pushed.
+            break;
+        }
     }
     if pushed == 0 {
         // The residual this leaves: an item under an unnameable owner keeps the identity it had
@@ -670,32 +741,44 @@ fn push_block_owner_descriptor(
 /// `pushed` counts the descriptors that actually landed. Each way of failing to name an owner is a
 /// SILENT residual -- the items under that owner keep the ambiguous identity they had before this
 /// walk existed -- so each is traced with its own reason rather than being passed over.
-fn push_owner_descriptor(
-    sema: &Semantics<'_, RootDatabase>,
+///
+/// Returns `false` only when the owner is one `named_owners` already holds, i.e. when this symbol has
+/// already been given that exact definition as a descriptor and the caller should stop walking. An
+/// owner that cannot be named returns `true`: nothing was named, but nothing was repeated either, and
+/// the walk above it is still worth doing.
+fn push_owner_descriptor<'db>(
+    sema: &Semantics<'db, RootDatabase>,
     edition: Edition,
     name: Option<ast::Name>,
     reverse_description: &mut Vec<MonikerDescriptor>,
     pushed: &mut usize,
-) {
+    named_owners: &mut Vec<Definition<'db>>,
+) -> bool {
     let db = sema.db;
     let Some(name) = name else {
         // `const _: () = { .. }`, `impl` -- no name token to resolve from.
         tracing::debug!("block owner has no name token");
-        return;
+        return true;
     };
     let Some(def) = NameClass::classify(sema, &name).and_then(NameClass::defined) else {
         tracing::debug!("block owner did not resolve to a definition");
-        return;
+        return true;
     };
-    let Some(name) = def.name(db) else {
+    if named_owners.contains(&def) {
+        tracing::debug!(?def, "block owner already named for this symbol");
+        return false;
+    }
+    let Some(display_name) = def.name(db) else {
         tracing::debug!(?def, "block owner definition has no name");
-        return;
+        return true;
     };
+    named_owners.push(def);
     reverse_description.push(MonikerDescriptor {
-        name: name.display(db, edition).to_string(),
+        name: display_name.display(db, edition).to_string(),
         desc: def_to_kind(db, def).into(),
     });
     *pushed += 1;
+    true
 }
 
 fn display<'db, T: HirDisplay<'db>>(db: &'db RootDatabase, module: hir::Module, it: T) -> String {
