@@ -45,7 +45,9 @@ use std::{
 };
 
 use arrayvec::ArrayVec;
-use base_db::{CrateDisplayName, CrateOrigin, LangCrateOrigin, SourceDatabase, all_crates};
+use base_db::{
+    CrateDisplayName, CrateOrigin, CrateTargetKind, LangCrateOrigin, SourceDatabase, all_crates,
+};
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, AssocItemLoc, BuiltinDeriveImplId, CallableDefId, ConstId, ConstParamId,
@@ -315,6 +317,13 @@ impl Crate {
 
     pub fn display_name(self, db: &dyn HirDatabase) -> Option<CrateDisplayName> {
         self.id.extra_data(db).display_name.clone()
+    }
+
+    /// Which cargo target this crate was built from, if the loader recorded one. `None` for every
+    /// project model that has no cargo targets, and a consumer must read that as "unknown" rather
+    /// than "not a lib" -- see `CrateTargetKind`.
+    pub fn target_kind(self, db: &dyn HirDatabase) -> Option<CrateTargetKind> {
+        self.id.extra_data(db).target_kind
     }
 
     pub fn query_external_importables(

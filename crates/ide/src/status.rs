@@ -44,7 +44,7 @@ pub(crate) fn status(db: &RootDatabase, file_id: Option<FileId>) -> String {
                 is_proc_macro,
                 proc_macro_cwd,
             } = crate_id.data(db);
-            let ExtraCrateData { version, display_name, potential_cfg_options } =
+            let ExtraCrateData { version, display_name, potential_cfg_options, target_kind } =
                 crate_id.extra_data(db);
             let cfg_options = crate_id.cfg_options(db);
             let env = crate_id.env(db);
@@ -63,6 +63,7 @@ pub(crate) fn status(db: &RootDatabase, file_id: Option<FileId>) -> String {
             format_to!(buf, "    Potential cfgs: {:?}\n", potential_cfg_options);
             format_to!(buf, "    Env: {:?}\n", env);
             format_to!(buf, "    Origin: {:?}\n", origin);
+            format_to!(buf, "    Cargo target kind: {:?}\n", target_kind);
             format_to!(buf, "    Extra crate-level attrs: {:?}\n", crate_attrs);
             format_to!(buf, "    Is a proc macro crate: {}\n", is_proc_macro);
             format_to!(buf, "    Proc macro cwd: {:?}\n", proc_macro_cwd);

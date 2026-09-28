@@ -40,6 +40,9 @@
                 },
             ),
             potential_cfg_options: None,
+            target_kind: Some(
+                Lib,
+            ),
         },
         cfg_options: CfgOptions(
             [
@@ -126,6 +129,9 @@
                 },
             ),
             potential_cfg_options: None,
+            target_kind: Some(
+                Bin,
+            ),
         },
         cfg_options: CfgOptions(
             [
@@ -212,6 +218,9 @@
                 },
             ),
             potential_cfg_options: None,
+            target_kind: Some(
+                Example,
+            ),
         },
         cfg_options: CfgOptions(
             [
@@ -298,6 +307,9 @@
                 },
             ),
             potential_cfg_options: None,
+            target_kind: Some(
+                Test,
+            ),
         },
         cfg_options: CfgOptions(
             [
@@ -379,6 +391,9 @@
                         "true",
                     ],
                 ),
+            ),
+            target_kind: Some(
+                Lib,
             ),
         },
         cfg_options: CfgOptions(

@@ -143,11 +143,12 @@ fn all_modules(db: &dyn HirDatabase) -> Vec<Module> {
 
 /// What `def` implements, as monikers (see `TokenStaticData::implements`).
 fn implemented_monikers(
-    db: &RootDatabase,
+    sema: &Semantics<'_, RootDatabase>,
     def: Definition<'_>,
     krate: hir::Crate,
 ) -> Vec<MonikerResult> {
     use hir::AsAssocItem;
+    let db = sema.db;
     let targets: Vec<Definition<'_>> = match def {
         Definition::Adt(adt) => hir::Impl::all_for_type(db, adt.ty(db))
             .into_iter()
@@ -169,7 +170,7 @@ fn implemented_monikers(
         },
         _ => vec![],
     };
-    targets.into_iter().filter_map(|t| def_to_moniker(db, t, krate)).collect()
+    targets.into_iter().filter_map(|t| def_to_moniker(sema, t, krate)).collect()
 }
 
 fn documentation_for_definition(
@@ -266,9 +267,9 @@ impl<'a> StaticIndex<'a> {
                         range: definition_range_excluding_trivia(&sema, it.file_id, it.full_range),
                     }),
                     references: vec![],
-                    moniker: current_crate.and_then(|cc| def_to_moniker(self.db, def, cc)),
+                    moniker: current_crate.and_then(|cc| def_to_moniker(&sema, def, cc)),
                     implements: current_crate
-                        .map(|cc| implemented_monikers(self.db, def, cc))
+                        .map(|cc| implemented_monikers(&sema, def, cc))
                         .unwrap_or_default(),
                     display_name: def
                         .name(self.db)

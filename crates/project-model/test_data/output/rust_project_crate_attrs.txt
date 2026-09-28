@@ -33,6 +33,7 @@
                 },
             ),
             potential_cfg_options: None,
+            target_kind: None,
         },
         cfg_options: CfgOptions(
             [

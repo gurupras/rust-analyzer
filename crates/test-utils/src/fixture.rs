@@ -144,6 +144,16 @@ pub struct Fixture {
     ///
     /// Syntax: `package:serde_test_suite`
     pub package: Option<String>,
+    /// Specifies which cargo TARGET KIND this crate was built from: `lib`, `bin`, `test`, `bench`,
+    /// `example`, `build-script`. Unset means the kind is unknown, which is what every non-cargo
+    /// project model reports, so a fixture that says nothing exercises the unknown-kind path.
+    ///
+    /// This is separate from `package:` because the two are independently wrong in practice: a bin
+    /// target named after its package is name-identical to the lib, so the kind is the only thing
+    /// that separates them.
+    ///
+    /// Syntax: `target:test`
+    pub target_kind: Option<String>,
     /// Actual file contents. All meta comments are stripped.
     pub text: String,
     /// The line number in the original fixture of the beginning of this fixture.
@@ -296,6 +306,7 @@ impl FixtureWithProjectMeta {
         let mut introduce_new_source_root = None;
         let mut library = false;
         let mut package = None;
+        let mut target_kind = None;
         for component in components {
             if component == "library" {
                 library = true;
@@ -334,6 +345,19 @@ impl FixtureWithProjectMeta {
                 }
                 "new_source_root" => introduce_new_source_root = Some(value.to_owned()),
                 "package" => package = Some(value.to_owned()),
+                "target" => {
+                    // Rejected here rather than at the consumer: a typo would otherwise parse as
+                    // "kind unknown", which is a legal value, so the test would pass for the wrong
+                    // reason -- it would be exercising the no-kind path while claiming a kind.
+                    assert!(
+                        matches!(
+                            value,
+                            "lib" | "bin" | "test" | "bench" | "example" | "build-script"
+                        ),
+                        "unknown target kind {value:?} in meta line: {meta:?}"
+                    );
+                    target_kind = Some(value.to_owned())
+                }
                 _ => panic!("bad component: {component:?}"),
             }
         }
@@ -359,6 +383,7 @@ impl FixtureWithProjectMeta {
             introduce_new_source_root,
             library,
             package,
+            target_kind,
         }
     }
 }

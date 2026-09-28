@@ -4,8 +4,8 @@ use std::{path::PathBuf, time::Instant};
 
 use ide::{
     AnalysisHost, LineCol, Moniker, MonikerDescriptorKind, MonikerIdentifier, MonikerResult,
-    RootDatabase, StaticIndex, StaticIndexedFile, SymbolInformationKind, TextRange, TokenId,
-    TokenStaticData, VendoredLibrariesConfig,
+    PackageInformation, RootDatabase, StaticIndex, StaticIndexedFile, SymbolInformationKind,
+    TextRange, TokenId, TokenStaticData, VendoredLibrariesConfig,
 };
 use ide_db::line_index;
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
@@ -504,12 +504,27 @@ impl SymbolGenerator {
 }
 
 fn moniker_to_symbol(moniker: &Moniker) -> scip_types::Symbol {
+    let PackageInformation { name, version, target, repo: _ } = &moniker.package_information;
+    // A cargo package is several crates -- the lib, each bin, each integration test, each bench,
+    // each example, `build.rs` -- and only the package name reached the symbol, so items of two
+    // targets of one package shared one symbol string. `ide` decides WHICH target has to be named
+    // (`None` for a lib, and for any project model with no targets); the spelling is decided here.
+    //
+    // It goes in the PACKAGE field, not in a descriptor: a descriptor named after a target collides
+    // with a real module of that name (`tests/test_de.rs` and `src/test_de.rs` in one package), while
+    // the package field cannot collide with anything inside a crate. `:` separates it because scip
+    // splits a symbol on spaces only, so the field stays one token and remains greppable as
+    // `serde_test_suite:test_de`.
+    let package_name = match target {
+        Some(target) => format!("{name}:{target}"),
+        None => name.clone(),
+    };
     scip_types::Symbol {
         scheme: "rust-analyzer".into(),
         package: Some(scip_types::Package {
             manager: "cargo".to_owned(),
-            name: moniker.package_information.name.clone(),
-            version: moniker.package_information.version.clone().unwrap_or_else(|| ".".to_owned()),
+            name: package_name,
+            version: version.clone().unwrap_or_else(|| ".".to_owned()),
             special_fields: Default::default(),
         })
         .into(),
@@ -1041,15 +1056,24 @@ pub mod example_mod {
 
     // These four used to be marked `// FIXME: This test represents current misbehavior` and to
     // expect the bare module-level symbol, with the suggested repair being to make these items
-    // *locals* (`local enclosed by ... func().`). This fork took the other repair: the enclosing
+    // *locals* (`local enclosed by ... func().`). This fork takes the other repair: the enclosing
     // function becomes part of the descriptor, so the item keeps a global symbol and that symbol is
-    // unique. The reason is the relationship plane, which is why this fork exists: a fn-local type
-    // can implement a trait, and `local` symbols are document-scoped, so an `is_implementation`
-    // edge out of one is not joinable across documents and drops out of the graph. A qualified
-    // global symbol keeps the edge and still disambiguates.
+    // unique.
     //
-    // The two repairs close the same collisions; they differ only in whether the edge survives. If
-    // upstream ever makes these locals, these expectations are the ones to revisit.
+    // NOT because the locals repair loses anything in SCIP. A `local ...` symbol is a well-formed
+    // SCIP symbol; SCIP's occurrence model is per document, and a consumer that resolves a reference
+    // inside the document it is reading follows a local symbol as well as a global one. Both repairs
+    // close exactly the same collisions.
+    //
+    // The reason is this fork's own consumer. Alexandria joins relationship edges ACROSS documents by
+    // symbol string: a fn-local type can implement a trait, and that `is_implementation` edge has to
+    // match a symbol emitted by whichever document defines the trait. A local symbol is unique only
+    // within the document that emits it, so there is nothing for the loader to match it against and
+    // the edge is dropped -- from the one plane this fork exists to fill. A qualified global symbol
+    // disambiguates and stays joinable.
+    //
+    // So this is a consumer requirement, not a defect in the alternative. If upstream ever makes
+    // these locals, these expectations are the ones to revisit.
     #[test]
     fn symbol_for_nested_function() {
         check_symbol(
@@ -1286,8 +1310,13 @@ pub mod example_mod {
     /// A KNOWN RESIDUAL: two blocks in ONE function. The function name is the only disambiguator, so
     /// this pair is still ambiguous. Recorded rather than fixed -- positions are not stable across
     /// edits. The same applies to two closures in one function.
+    ///
+    /// The claim is an EQUALITY, so both halves are asserted against the SAME string. Pinning only
+    /// the first half would keep passing if the second half moved, which is precisely the change that
+    /// would retire this residual.
     #[test]
     fn two_blocks_in_one_fn_are_not_disambiguated() {
+        let both = "rust-analyzer cargo main . func().Helper#";
         check_symbol(
             r#"
     //- /workspace/lib.rs crate:main
@@ -1296,16 +1325,29 @@ pub mod example_mod {
        { struct Helper; }
     }
     "#,
-            "rust-analyzer cargo main . func().Helper#",
+            both,
+        );
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub fn func() {
+       { struct Helper; }
+       { struct Helper$0; }
+    }
+    "#,
+            both,
         );
     }
 
-    /// A KNOWN RESIDUAL: the walk stops at the function and never reaches the `impl`, so a fn-local
-    /// item under `impl A` and under `impl B` are both `m().Helper#` and still collide. Naming the
-    /// impl would mean spelling its self type from syntax, which would not match the hir-rendered
-    /// form the `SelfType` arm emits elsewhere. Asserted so the hole is a record, not a surprise.
+    /// The `impl` an associated fn belongs to is named, so a fn-local item under `impl A` and under
+    /// `impl B` no longer collide. The caller's own walk cannot reach the impl: a block module's
+    /// parent is the module the impl lives in, so without this the pair was both `m().Helper#`.
+    ///
+    /// The impl is spelled by the same hir renderer the `Definition::SelfType` arm uses, in the same
+    /// order (`impl`, self type, then trait for a trait impl), so this agrees with the impl's own
+    /// symbol rather than being a second syntax-derived spelling of it.
     #[test]
-    fn fn_local_item_under_an_impl_is_not_qualified_by_the_impl() {
+    fn fn_local_item_under_an_impl_is_qualified_by_the_impl() {
         check_symbol(
             r#"
     //- /workspace/lib.rs crate:main
@@ -1316,25 +1358,152 @@ pub mod example_mod {
        }
     }
     "#,
-            "rust-analyzer cargo main . m().Helper#",
+            "rust-analyzer cargo main . impl#[A]m().Helper#",
+        );
+    }
+
+    /// The pair the impl descriptor exists for: same fn name, same local item name, two impls. Read
+    /// with the test above -- the two expectations differ only in the self type.
+    #[test]
+    fn fn_local_items_under_two_impls_are_distinct() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub struct A;
+    pub struct B;
+    impl A {
+       pub fn m() {
+           struct Helper$0;
+       }
+    }
+    impl B {
+       pub fn m() {
+           struct Helper;
+       }
+    }
+    "#,
+            "rust-analyzer cargo main . impl#[A]m().Helper#",
+        );
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub struct A;
+    pub struct B;
+    impl A {
+       pub fn m() {
+           struct Helper;
+       }
+    }
+    impl B {
+       pub fn m() {
+           struct Helper$0;
+       }
+    }
+    "#,
+            "rust-analyzer cargo main . impl#[B]m().Helper#",
+        );
+    }
+
+    /// A trait impl carries the trait as well, again in the `SelfType` arm's order: `impl`, self type,
+    /// trait. Two impls of two traits for ONE type would otherwise still collide.
+    #[test]
+    fn fn_local_item_under_a_trait_impl_names_the_trait() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub struct A;
+    pub trait T { fn m(); }
+    impl T for A {
+       fn m() {
+           struct Helper$0;
+       }
+    }
+    "#,
+            "rust-analyzer cargo main . impl#[A][T]m().Helper#",
+        );
+    }
+
+    /// A trait's own default body is the other container the caller's walk cannot reach.
+    #[test]
+    fn fn_local_item_in_a_trait_default_body_is_qualified_by_the_trait() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub trait T {
+       fn m() {
+           struct Helper$0;
+       }
+    }
+    "#,
+            "rust-analyzer cargo main . T#m().Helper#",
+        );
+    }
+
+    /// An enum variant's discriminant is a body whose owner is the VARIANT, and a variant is not an
+    /// `ast::Item`, so the walk used to skip to the enum and produce `E#Helper#` -- the same string a
+    /// type member `E::Helper` would get. Both the variant and the enum are named now.
+    #[test]
+    fn item_in_a_variant_discriminant_names_the_variant() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub enum E {
+       A = { struct Helper$0; 0 },
+    }
+    "#,
+            "rust-analyzer cargo main . E#A#Helper#",
+        );
+    }
+
+    /// A block GENERATED BY A MACRO is in a macro file whose root is the expansion, so a plain
+    /// `SyntaxNode::ancestors()` ended at that root, found no item and named nothing: the item came
+    /// out as a bare `Helper#`, which collides with a module-level `Helper` and with the `Helper` of
+    /// every other fn whose block came from a macro. Climbing out of the expansion reaches the macro
+    /// call and, above it, the enclosing fn in the caller's file. This is the `select!` shape: the
+    /// ITEM is written by the caller and passed in as an `$i:item` fragment, and only the BLOCK around
+    /// it comes from the macro, so the block is still in the expansion.
+    ///
+    /// The item has to be the caller's. With the macro generating the item too
+    /// (`($n:ident) => { { struct $n; } }`, cursor on `gen!(Helper)`) there is no reachable cursor:
+    /// inside the macro body `check_symbol` gets no symbol ("must have one symbol None"), and on the
+    /// argument neither `StaticIndex` nor `Analysis::moniker` resolves the token -- not even with the
+    /// block and the fn removed from the fixture, so that is a limit of the instrument and not of this
+    /// walk.
+    #[test]
+    fn item_in_a_macro_generated_block_is_qualified_by_the_enclosing_fn() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    macro_rules! wrap {
+       ($i:item) => { { $i } };
+    }
+    pub fn func() {
+       wrap! { struct Helper$0; }
+    }
+    "#,
+            "rust-analyzer cargo main . func().Helper#",
         );
     }
 
     /// Two integration-test targets of ONE package, each defining `Data`. The symbol's package field
     /// is the package name for both and nothing else named the target, so both computed
-    /// `... serde_test_suite 0.0.0 Data#`. On serde this class was 103 of 196 colliding symbols, and
-    /// `Enum#` alone covered 11 definitions in 11 test targets. Both halves are asserted, since
-    /// pinning one alone passes when it equals the string it used to collide with.
+    /// `... serde_test_suite 0.0.0 Data#`. On serde this class was 103 of 196 colliding symbols; the
+    /// largest single member is `serde_test_suite 0.0.0 crate/`, the crate root of 21 integration-test
+    /// targets under one name. (Rows of that report are grouped by class, so an exemplar has to be
+    /// read with its heading: `Enum#`, 11 sites, is a FN-LOCAL collision, not this class.)
+    ///
+    /// Both halves are asserted, since pinning one alone passes when it equals the string it used to
+    /// collide with.
     #[test]
     fn same_item_in_two_test_targets_of_one_package_is_distinct_a() {
         check_symbol(
             r#"
-    //- /workspace/tests/test_de.rs crate:test_de package:serde_test_suite
+    //- /workspace/tests/test_de.rs crate:test_de package:serde_test_suite target:test
     struct Data$0;
-    //- /workspace/tests/test_ser.rs crate:test_ser package:serde_test_suite
+    //- /workspace/tests/test_ser.rs crate:test_ser package:serde_test_suite target:test
     struct Data;
     "#,
-            "rust-analyzer cargo serde_test_suite . test_de/Data#",
+            "rust-analyzer cargo serde_test_suite:test_de . Data#",
         );
     }
 
@@ -1342,38 +1511,38 @@ pub mod example_mod {
     fn same_item_in_two_test_targets_of_one_package_is_distinct_b() {
         check_symbol(
             r#"
-    //- /workspace/tests/test_de.rs crate:test_de package:serde_test_suite
+    //- /workspace/tests/test_de.rs crate:test_de package:serde_test_suite target:test
     struct Data;
-    //- /workspace/tests/test_ser.rs crate:test_ser package:serde_test_suite
+    //- /workspace/tests/test_ser.rs crate:test_ser package:serde_test_suite target:test
     struct Data$0;
     "#,
-            "rust-analyzer cargo serde_test_suite . test_ser/Data#",
+            "rust-analyzer cargo serde_test_suite:test_ser . Data#",
         );
     }
 
-    /// `build.rs` is a target of the package too, so it is a crate whose name differs from the
-    /// package's. Before this it shared the package's whole namespace with the lib target.
+    /// `build.rs` is a target of the package too, so it is its own crate. Before this it shared the
+    /// package's whole namespace with the lib target.
     #[test]
     fn build_script_target_is_distinct_from_the_lib_target() {
         check_symbol(
             r#"
-    //- /workspace/build.rs crate:build_script_build package:mypkg
+    //- /workspace/build.rs crate:build_script_build package:mypkg target:build-script
     struct Shared$0;
-    //- /workspace/src/lib.rs crate:mypkg package:mypkg
+    //- /workspace/src/lib.rs crate:mypkg package:mypkg target:lib
     struct Shared;
     "#,
-            "rust-analyzer cargo mypkg . build_script_build/Shared#",
+            "rust-analyzer cargo mypkg:build_script_build . Shared#",
         );
     }
 
-    /// CONTROL for this half: the package's like-named LIBRARY target keeps exactly the symbol it
-    /// had, with no target namespace inserted. This is the common case -- almost every symbol in a
-    /// normal dependency -- so if it changed, the whole index would churn for nothing.
+    /// CONTROL for this half: the package's LIBRARY target keeps exactly the symbol it had. This is
+    /// the common case -- almost every symbol in a normal dependency -- so if it changed, the whole
+    /// index would churn for nothing.
     #[test]
-    fn lib_target_symbol_has_no_target_namespace() {
+    fn lib_target_symbol_is_not_qualified() {
         check_symbol(
             r#"
-    //- /workspace/src/lib.rs crate:mypkg package:mypkg
+    //- /workspace/src/lib.rs crate:mypkg package:mypkg target:lib
     pub mod m {
        pub struct Plain$0;
     }
@@ -1382,37 +1551,207 @@ pub mod example_mod {
         );
     }
 
-    /// CONTROL, the other direction: a package name spelled with `-` and a crate name with `_` are
-    /// the SAME target, not two. Comparing them raw would insert a namespace into every symbol of
-    /// every hyphenated package -- the single largest churn this change could wrongly cause.
+    /// CONTROL: a lib target whose name differs from its package (`[lib] name = "..."`, or the
+    /// `-`/`_` spelling of any hyphenated package) is still the lib, and must NOT be qualified. This
+    /// is what makes the test a KIND question rather than a name comparison: comparing the crate name
+    /// against the package name would qualify every symbol of every such package.
     #[test]
-    fn hyphenated_package_name_is_not_a_different_target() {
+    fn renamed_lib_target_is_not_qualified() {
         check_symbol(
             r#"
-    //- /workspace/src/lib.rs crate:serde_derive package:serde-derive
+    //- /workspace/src/lib.rs crate:serde_derive package:serde-derive target:lib
     pub struct Plain$0;
     "#,
             "rust-analyzer cargo serde-derive . Plain#",
         );
     }
 
-    /// The crate ROOT module of a non-lib target: the target name takes the place of `crate`, rather
-    /// than being added in front of it, because it identifies the root exactly as `crate` does and
-    /// unlike `crate` it is unique within the package.
+    /// The other direction of the same point: a bin target named after its own package -- what
+    /// `src/main.rs` gives you -- IS qualified, because the kind says it is not the lib. A name
+    /// comparison could not see this case at all, and it is the common one for a binary crate.
+    ///
+    /// The lib half cannot be written into this fixture: `ChangeFixture` rejects two crates with the
+    /// same name, and `foo`'s lib and bin are both named `foo`. `lib_target_symbol_is_not_qualified`
+    /// is the other half -- the two expectations differ, which is the property being asserted.
     #[test]
-    fn crate_root_of_a_non_lib_target_is_named_by_the_target() {
+    fn bin_target_named_after_its_package_is_qualified() {
         check_symbol(
             r#"
-    //- /workspace/tests/test_de.rs crate:test_de package:serde_test_suite
+    //- /workspace/src/main.rs crate:foo package:foo target:bin
+    pub struct Plain$0;
+    "#,
+            "rust-analyzer cargo foo:foo . Plain#",
+        );
+    }
+
+    /// CONTROL for every project model that reports no cargo targets -- a JSON project, a detached
+    /// file, most test fixtures. An unknown kind must read as "leave it alone", not as "not a lib":
+    /// the other way round, every symbol of every such project would be qualified by its own crate
+    /// name, which is churn with no collision to show for it.
+    #[test]
+    fn crate_with_no_known_target_kind_is_not_qualified() {
+        check_symbol(
+            r#"
+    //- /workspace/src/lib.rs crate:mypkg package:mypkg
+    pub struct Plain$0;
+    "#,
+            "rust-analyzer cargo mypkg . Plain#",
+        );
+    }
+
+    /// A symbol must not depend on how the PRODUCER was configured. `cargo.allTargets` decides
+    /// whether a package's test and bench targets are in the crate graph at all, and `scip.rs` is the
+    /// one consumer that takes it from the user's `--config-path` (`config.cargo(None)`, where
+    /// `analysis_stats`, `lsif`, `diagnostics` and `ssr` hardcode `true`). So a rule of the form "is
+    /// this package's target count greater than one" would spell ripgrep's `main()` differently for
+    /// two producers of the same commit.
+    ///
+    /// This pair is the testable substitute: the same bin crate alone, and beside a sibling test
+    /// target of the same package, must give a byte-identical symbol. The step from `allTargets` to
+    /// "a sibling crate is present in the graph" is NOT established here -- a `ChangeFixture` has no
+    /// `CargoWorkspace` and cannot set the flag -- but by reading `cargo_workspace.rs` (where the flag
+    /// is consumed) and `build_dependencies.rs`.
+    #[test]
+    fn bin_symbol_does_not_depend_on_a_sibling_test_target_a() {
+        check_symbol(
+            r#"
+    //- /workspace/src/main.rs crate:rg package:ripgrep target:bin
+    pub fn main$0() {}
+    "#,
+            "rust-analyzer cargo ripgrep:rg . main().",
+        );
+    }
+
+    #[test]
+    fn bin_symbol_does_not_depend_on_a_sibling_test_target_b() {
+        check_symbol(
+            r#"
+    //- /workspace/src/main.rs crate:rg package:ripgrep target:bin
+    pub fn main$0() {}
+    //- /workspace/tests/integration.rs crate:integration package:ripgrep target:test
+    fn t() {}
+    "#,
+            "rust-analyzer cargo ripgrep:rg . main().",
+        );
+    }
+
+    /// The crate ROOT module of a non-lib target. The target is named in the package field, so the
+    /// root keeps the `crate` descriptor it always had (and, as before, drops it when the symbol has
+    /// other descriptors to carry).
+    #[test]
+    fn crate_root_of_a_non_lib_target_is_qualified_in_the_package_field() {
+        check_symbol(
+            r#"
+    //- /workspace/tests/test_de.rs crate:test_de package:serde_test_suite target:test
     pub mod inner$0 {}
     "#,
-            "rust-analyzer cargo serde_test_suite . test_de/inner/",
+            "rust-analyzer cargo serde_test_suite:test_de . inner/",
+        );
+    }
+
+    /// A module named after a target is why the target goes in the package field and not into a
+    /// descriptor: as a descriptor, `serde_test_suite . test_de/Data#` would be produced BOTH by
+    /// `Data` in the test target `test_de` and by `Data` in a module `test_de` of the lib -- a new
+    /// collision created by the fix for the old one. In the package field the two cannot meet.
+    #[test]
+    fn a_module_named_like_a_target_does_not_collide_with_it() {
+        check_symbol(
+            r#"
+    //- /workspace/src/lib.rs crate:serde_test_suite package:serde_test_suite target:lib
+    pub mod test_de {
+       pub struct Data$0;
+    }
+    "#,
+            "rust-analyzer cargo serde_test_suite . test_de/Data#",
+        );
+    }
+
+    /// B1. One file can belong to several crates, and a `mod common;` pulled into two integration
+    /// tests is exactly that. The crate a symbol is keyed to therefore cannot be "the crate of the
+    /// module the walk happened to produce": the definition in `common.rs` is reached through the
+    /// canonical owner of that file, while a reference from `tests/b.rs` is reached through crate
+    /// `b`'s own tree, so the two would name different packages and would NOT JOIN. Unjoined is worse
+    /// than collided: a collision at least links the sites together.
+    ///
+    /// The definition side and the reference-from-the-other-crate side assert the SAME string; that
+    /// they are equal is the whole point, so both are spelled out rather than compared to a variable.
+    #[test]
+    fn a_file_shared_by_two_test_targets_keys_to_one_crate_def() {
+        check_symbol(
+            r#"
+    //- /workspace/tests/a.rs crate:a package:p target:test
+    mod common;
+    //- /workspace/tests/b.rs crate:b package:p target:test
+    mod common;
+    //- /workspace/tests/common.rs
+    pub fn helper$0() {}
+    "#,
+            "rust-analyzer cargo p:a . common/helper().",
+        );
+    }
+
+    #[test]
+    fn a_file_shared_by_two_test_targets_keys_to_one_crate_ref() {
+        check_symbol(
+            r#"
+    //- /workspace/tests/a.rs crate:a package:p target:test
+    mod common;
+    //- /workspace/tests/b.rs crate:b package:p target:test
+    mod common;
+    fn use_it() { common::helper$0(); }
+    //- /workspace/tests/common.rs
+    pub fn helper() {}
+    "#,
+            "rust-analyzer cargo p:a . common/helper().",
+        );
+    }
+
+    /// The MODULE of a shared file is the same case and needs its own pair, because a module's file
+    /// and its parent's file can differ: here `common` lives in `tests/common.rs`, shared, while the
+    /// `mod common;` that declares it is written once per test target. Keyed through the parent -- the
+    /// module the definition sits IN, which is what every other definition is keyed through -- the
+    /// declaration in `b.rs` named package `p:b` while the module's own document named `p:a`, so a
+    /// module symbol did not join across targets. Measured on tokio before this: 11 unjoined module
+    /// symbols, all of them `tests/support` files pulled into several integration tests, plus 3 on
+    /// serde. Both arms assert the SAME string, which is the whole point of the pair.
+    #[test]
+    fn a_module_of_a_file_shared_by_two_test_targets_keys_to_one_crate_a() {
+        check_symbol(
+            r#"
+    //- /workspace/tests/a.rs crate:a package:p target:test
+    mod common$0;
+    //- /workspace/tests/b.rs crate:b package:p target:test
+    mod common;
+    //- /workspace/tests/common.rs
+    pub fn helper() {}
+    "#,
+            "rust-analyzer cargo p:a . common/",
+        );
+    }
+
+    #[test]
+    fn a_module_of_a_file_shared_by_two_test_targets_keys_to_one_crate_b() {
+        check_symbol(
+            r#"
+    //- /workspace/tests/a.rs crate:a package:p target:test
+    mod common;
+    //- /workspace/tests/b.rs crate:b package:p target:test
+    mod common$0;
+    //- /workspace/tests/common.rs
+    pub fn helper() {}
+    "#,
+            "rust-analyzer cargo p:a . common/",
         );
     }
 
     /// CONTROL. A module-level item must be completely unaffected: if this string changed, the
     /// descriptor change would be churning symbols it has no business touching, and the measured
-    /// churn figure (serde 16.59% of definition sites) would be wrong in the other direction.
+    /// churn figure (serde 16.55% of definition sites) would be wrong in the other direction.
+    /// That figure is from the corrected instrument. An earlier version of it said 16.59% with 92
+    /// fn-local collisions; that version excluded a symbol's own site by identity rather than by
+    /// span, so collisions landed in the wrong class, and 16.59% is retracted rather than merely
+    /// superseded. Any figure of the same shape cited elsewhere has to be re-read from the current
+    /// run, not carried across.
     #[test]
     fn module_level_item_symbol_is_unchanged() {
         check_symbol(

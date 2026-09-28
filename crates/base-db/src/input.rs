@@ -218,6 +218,41 @@ impl CrateOrigin {
     }
 }
 
+/// Which kind of cargo target a crate was built from, where that is known.
+///
+/// Every target of a cargo package -- the lib, each bin, each integration test, each bench, each
+/// example, `build.rs` -- is a separate crate, and only the PACKAGE name reaches a crate's identity.
+/// A consumer that has to tell those crates apart (the scip exporter does) needs the kind, not a
+/// comparison of the target name against the package name: a package `foo` whose bin target is also
+/// named `foo`, which is what `src/main.rs` gives you, is name-identical to that package's lib.
+///
+/// Absence is not `Other`. This is `None` for every loader that has no cargo targets to report (JSON
+/// projects, detached files, test fixtures that do not say otherwise), and consumers must then behave
+/// exactly as they did before this datum existed. `Other` means cargo reported a kind this enum does
+/// not model: the same *decision* as `None` for today's consumers, but a different *fact*, so the two
+/// are kept apart rather than folded together at the producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CrateTargetKind {
+    /// Any cargo lib crate-type, including proc-macro. There is at most one per package and it is
+    /// the target a package's dependents name, so it is the one whose symbols must not be qualified.
+    Lib,
+    Bin,
+    Test,
+    Bench,
+    Example,
+    BuildScript,
+    Other,
+}
+
+impl CrateTargetKind {
+    /// Whether a consumer may treat this crate as the package's library target. Deliberately not
+    /// `== Lib`: the question asked at the call site is "may I leave this crate's symbols alone",
+    /// and an unmodelled kind has to answer yes, the same way a missing kind does.
+    pub fn is_lib_like(&self) -> bool {
+        matches!(self, CrateTargetKind::Lib | CrateTargetKind::Other)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LangCrateOrigin {
     Alloc,
@@ -386,6 +421,13 @@ pub struct ExtraCrateData {
     pub display_name: Option<CrateDisplayName>,
     /// The cfg options that could be used by the crate
     pub potential_cfg_options: Option<CfgOptions>,
+    /// Which cargo target this crate was built from, if the loader knows. See `CrateTargetKind`:
+    /// `None` means "not known" and must be read as "leave this crate's symbols alone".
+    ///
+    /// Set through `CrateGraphBuilder::set_target_kind` rather than an `add_crate_root` parameter,
+    /// because only the cargo loader has a target to report and the other 20-odd call sites of
+    /// `add_crate_root` would have to state something they cannot know.
+    pub target_kind: Option<CrateTargetKind>,
 }
 
 #[derive(Default, Clone, PartialEq, Eq)]
@@ -565,11 +607,23 @@ impl CrateGraphBuilder {
                 is_proc_macro,
                 proc_macro_cwd,
             },
-            extra: ExtraCrateData { version, display_name, potential_cfg_options },
+            extra: ExtraCrateData {
+                version,
+                display_name,
+                potential_cfg_options,
+                target_kind: None,
+            },
             cfg_options,
             env,
             ws_data,
         })
+    }
+
+    /// Record which cargo target `krate` was built from. Only a loader that has the target in hand
+    /// calls this; a crate whose kind is never set keeps `None`, which every consumer reads as the
+    /// pre-existing behaviour, so a missed call loses a distinction rather than inventing one.
+    pub fn set_target_kind(&mut self, krate: CrateBuilderId, kind: CrateTargetKind) {
+        self.arena[krate].extra.target_kind = Some(kind);
     }
 
     pub fn add_dep(

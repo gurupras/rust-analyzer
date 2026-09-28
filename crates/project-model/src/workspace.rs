@@ -7,7 +7,7 @@ use std::{collections::VecDeque, fmt, fs, iter, ops::Deref, sync, thread};
 
 use anyhow::Context;
 use base_db::{
-    CrateBuilderId, CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin,
+    CrateBuilderId, CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateTargetKind,
     CrateWorkspaceData, DependencyBuilder, Env, LangCrateOrigin, ProcMacroLoadingError,
     ProcMacroPaths, target::TargetLoadResult,
 };
@@ -1705,6 +1705,22 @@ fn add_target_crate_root(
         matches!(kind, TargetKind::Lib { is_proc_macro: true }),
         proc_macro_cwd,
         crate_ws_data,
+    );
+    // Recorded here because this is the only place a cargo target and a crate id are both in hand.
+    // A consumer that has to tell two crates of one package apart cannot do it from the crate's name:
+    // the display name is the TARGET name and `CrateOrigin`'s is the PACKAGE name, and for a package
+    // whose bin is named after it those are the same string as the lib's.
+    crate_graph.set_target_kind(
+        crate_id,
+        match kind {
+            TargetKind::Lib { .. } => CrateTargetKind::Lib,
+            TargetKind::Bin => CrateTargetKind::Bin,
+            TargetKind::Test => CrateTargetKind::Test,
+            TargetKind::Bench => CrateTargetKind::Bench,
+            TargetKind::Example => CrateTargetKind::Example,
+            TargetKind::BuildScript => CrateTargetKind::BuildScript,
+            TargetKind::Other => CrateTargetKind::Other,
+        },
     );
     if let TargetKind::Lib { is_proc_macro: true } = kind {
         let proc_macro = match build_data {

@@ -105,12 +105,27 @@ impl<'db> Definition<'db> {
     }
 
     pub fn enclosing_definition(&self, db: &RootDatabase) -> Option<Definition<'db>> {
-        fn container_to_definition<'db>(container: ItemContainer) -> Option<Definition<'db>> {
+        fn container_to_definition<'db>(
+            db: &RootDatabase,
+            container: ItemContainer,
+        ) -> Option<Definition<'db>> {
             match container {
                 ItemContainer::Trait(it) => Some(it.into()),
                 ItemContainer::Impl(it) => Some(it.into()),
                 ItemContainer::Module(it) => Some(it.into()),
-                ItemContainer::ExternBlock(_) | ItemContainer::Crate(_) => None,
+                // An extern block is not a namespace: `mod m { extern "C" { fn f(); } }` is
+                // referred to as `m::f`, so the enclosing definition is the block's module and the
+                // block itself contributes nothing. Returning `None` here truncated every walk over
+                // an extern item at the item, so consumers that build a path by walking outwards
+                // (`ide::moniker`) gave `f()` no module path at all, and two extern fns of the same
+                // name in two modules of one crate got the same path.
+                ItemContainer::ExternBlock(it) => Some(it.module(db).into()),
+                // NOT the same case. Only `Module::container` produces `Crate`, and a module never
+                // reaches this helper -- `Definition::Module` takes the `parent` arm below. Mapping
+                // it to `Definition::Crate` would be worse than `None` for the walkers: `Crate` has
+                // a `name`, so they would push a descriptor spelled with the crate's name next to
+                // the `crate` root descriptor they already emit.
+                ItemContainer::Crate(_) => None,
             }
         }
         match self {
@@ -118,18 +133,18 @@ impl<'db> Definition<'db> {
             Definition::Module(it) => it.parent(db).map(Definition::Module),
             Definition::Crate(_) => None,
             Definition::Field(it) => Some(it.parent_def(db).into()),
-            Definition::Function(it) => container_to_definition(it.container(db)),
+            Definition::Function(it) => container_to_definition(db, it.container(db)),
             Definition::Adt(it) => Some(it.module(db).into()),
-            Definition::Const(it) => container_to_definition(it.container(db)),
-            Definition::Static(it) => container_to_definition(it.container(db)),
-            Definition::Trait(it) => container_to_definition(it.container(db)),
-            Definition::TypeAlias(it) => container_to_definition(it.container(db)),
+            Definition::Const(it) => container_to_definition(db, it.container(db)),
+            Definition::Static(it) => container_to_definition(db, it.container(db)),
+            Definition::Trait(it) => container_to_definition(db, it.container(db)),
+            Definition::TypeAlias(it) => container_to_definition(db, it.container(db)),
             Definition::EnumVariant(it) => Some(Adt::Enum(it.parent_enum(db)).into()),
             Definition::SelfType(it) => Some(it.module(db).into()),
             Definition::Local(it) => it.parent(db).try_into().ok(),
             Definition::GenericParam(it) => Some(it.parent().into()),
             Definition::Label(it) => it.parent(db).try_into().ok(),
-            Definition::ExternCrateDecl(it) => container_to_definition(it.container(db)),
+            Definition::ExternCrateDecl(it) => container_to_definition(db, it.container(db)),
             Definition::DeriveHelper(it) => Some(it.derive().module(db).into()),
             Definition::InlineAsmOperand(it) => it.parent(db).try_into().ok(),
             Definition::BuiltinAttr(_)

@@ -9,9 +9,9 @@ use std::{any::TypeId, mem, str::FromStr, sync};
 
 use base_db::target::TargetData;
 use base_db::{
-    Crate, CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData,
-    DependencyBuilder, Env, FileChange, FileSet, FxIndexMap, LangCrateOrigin, SourceDatabase,
-    SourceRoot, Version, VfsPath, all_crates,
+    Crate, CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateTargetKind,
+    CrateWorkspaceData, DependencyBuilder, Env, FileChange, FileSet, FxIndexMap, LangCrateOrigin,
+    SourceDatabase, SourceRoot, Version, VfsPath, all_crates,
 };
 use cfg::CfgOptions;
 use hir_expand::{
@@ -352,6 +352,9 @@ impl ChangeFixture {
                     proc_macro_cwd.clone(),
                     crate_ws_data.clone(),
                 );
+                if let Some(target_kind) = meta.target_kind {
+                    crate_graph.set_target_kind(crate_id, target_kind);
+                }
                 let prev = crates.insert(crate_name.clone(), crate_id);
                 assert!(prev.is_none(), "multiple crates with same name: {crate_name}");
                 for dep in meta.deps {
@@ -749,6 +752,9 @@ struct FileMeta {
     env: Env,
     crate_attrs: Vec<String>,
     introduce_new_source_root: Option<SourceRootKind>,
+    /// `None` reproduces what a non-cargo project model reports, which is what every fixture that
+    /// does not say `target:` should get.
+    target_kind: Option<CrateTargetKind>,
 }
 
 impl FileMeta {
@@ -783,6 +789,17 @@ impl FileMeta {
             env: f.env.into_iter().collect(),
             crate_attrs: f.crate_attrs,
             introduce_new_source_root,
+            // The string was validated by the fixture parser, so an unknown value panicked there
+            // rather than arriving here as "no kind".
+            target_kind: f.target_kind.map(|kind| match &*kind {
+                "lib" => CrateTargetKind::Lib,
+                "bin" => CrateTargetKind::Bin,
+                "test" => CrateTargetKind::Test,
+                "bench" => CrateTargetKind::Bench,
+                "example" => CrateTargetKind::Example,
+                "build-script" => CrateTargetKind::BuildScript,
+                invalid => panic!("invalid target kind '{invalid}'"),
+            }),
         }
     }
 }
