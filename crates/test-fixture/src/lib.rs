@@ -773,7 +773,9 @@ impl FileMeta {
         let deps = f.deps;
         Self {
             path: f.path,
-            krate: f.krate.map(|it| parse_crate(it, current_source_root_kind, f.library)),
+            krate: f
+                .krate
+                .map(|it| parse_crate(it, current_source_root_kind, f.library, f.package)),
             extern_prelude: f.extern_prelude,
             deps,
             cfg,
@@ -795,6 +797,7 @@ fn parse_crate(
     crate_str: String,
     current_source_root_kind: SourceRootKind,
     explicit_non_workspace_member: bool,
+    package: Option<String>,
 ) -> (String, CrateOrigin, Option<String>) {
     let (crate_str, force_non_lang_origin) = if let Some(s) = crate_str.strip_prefix("r#") {
         (s.to_owned(), ForceNoneLangOrigin::Yes)
@@ -816,21 +819,25 @@ fn parse_crate(
     let non_workspace_member = explicit_non_workspace_member
         || matches!(current_source_root_kind, SourceRootKind::Library);
 
+    // `CrateOrigin`'s name is the cargo PACKAGE name, which is not the crate name: a package's
+    // lib, bins, integration tests and `build.rs` are separate crates named after their TARGET.
+    // `package:` lets a fixture say so; without it the two are equal, as they are for a lib target
+    // whose name matches its package.
+    let package_name = Symbol::intern(package.as_deref().unwrap_or(&name));
+
     let origin = if force_non_lang_origin == ForceNoneLangOrigin::Yes {
-        let name = Symbol::intern(&name);
         if non_workspace_member {
-            CrateOrigin::Library { repo, name }
+            CrateOrigin::Library { repo, name: package_name }
         } else {
-            CrateOrigin::Local { repo, name: Some(name) }
+            CrateOrigin::Local { repo, name: Some(package_name) }
         }
     } else {
         match LangCrateOrigin::from(&*name) {
             LangCrateOrigin::Other => {
-                let name = Symbol::intern(&name);
                 if non_workspace_member {
-                    CrateOrigin::Library { repo, name }
+                    CrateOrigin::Library { repo, name: package_name }
                 } else {
-                    CrateOrigin::Local { repo, name: Some(name) }
+                    CrateOrigin::Local { repo, name: Some(package_name) }
                 }
             }
             origin => CrateOrigin::Lang(origin),

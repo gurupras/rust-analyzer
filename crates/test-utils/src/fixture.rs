@@ -136,6 +136,14 @@ pub struct Fixture {
     ///
     /// Syntax: `library`
     pub library: bool,
+    /// Specifies the cargo PACKAGE this crate is a target of, when it differs from the crate name.
+    /// Every cargo target -- lib, bin, each integration test, `build.rs` -- is a separate crate whose
+    /// name is the TARGET name, while the name in `CrateOrigin` is the PACKAGE name. Without this,
+    /// a fixture cannot express two crates of one package, which is the shape that makes two
+    /// integration tests defining the same item compute one moniker.
+    ///
+    /// Syntax: `package:serde_test_suite`
+    pub package: Option<String>,
     /// Actual file contents. All meta comments are stripped.
     pub text: String,
     /// The line number in the original fixture of the beginning of this fixture.
@@ -287,6 +295,7 @@ impl FixtureWithProjectMeta {
         let mut env = FxHashMap::default();
         let mut introduce_new_source_root = None;
         let mut library = false;
+        let mut package = None;
         for component in components {
             if component == "library" {
                 library = true;
@@ -324,6 +333,7 @@ impl FixtureWithProjectMeta {
                     }
                 }
                 "new_source_root" => introduce_new_source_root = Some(value.to_owned()),
+                "package" => package = Some(value.to_owned()),
                 _ => panic!("bad component: {component:?}"),
             }
         }
@@ -348,6 +358,7 @@ impl FixtureWithProjectMeta {
             env,
             introduce_new_source_root,
             library,
+            package,
         }
     }
 }

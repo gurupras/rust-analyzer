@@ -324,13 +324,32 @@ fn def_to_non_local_moniker(
                 } else {
                     match def {
                         Definition::Module(module) if module.is_crate_root(db) => {
-                            // only include `crate` namespace by itself because we prefer
-                            // `rust-analyzer cargo foo . bar/` over `rust-analyzer cargo foo . crate/bar/`
-                            if reverse_description.is_empty() {
-                                reverse_description.push(MonikerDescriptor {
-                                    name: "crate".to_owned(),
+                            // The crate root has to carry the cargo TARGET when there is more than
+                            // one target in the package. The symbol's package field is the PACKAGE
+                            // name and nothing else in the symbol names the target, yet every
+                            // target -- lib, each bin, each integration test, `build.rs` -- is a
+                            // separate crate, so two test binaries of one package that both define
+                            // `Enum` computed ONE symbol string. On serde, 103 of 196 colliding
+                            // symbols have no fn-local site at all and so can only be this or a real
+                            // module path; the single largest is `serde_test_suite 0.0.0 crate/`,
+                            // which is the crate root of 21 integration-test targets under one name.
+                            match non_package_crate_name(db, krate) {
+                                // The target name replaces `crate` rather than being added in front
+                                // of it: it identifies the crate root exactly as `crate` does, and
+                                // unlike `crate` it is unique within the package.
+                                Some(target) => reverse_description.push(MonikerDescriptor {
+                                    name: target,
                                     desc: MonikerDescriptorKind::Namespace,
-                                });
+                                }),
+                                // only include `crate` namespace by itself because we prefer
+                                // `rust-analyzer cargo foo . bar/` over `rust-analyzer cargo foo . crate/bar/`
+                                None if reverse_description.is_empty() => {
+                                    reverse_description.push(MonikerDescriptor {
+                                        name: "crate".to_owned(),
+                                        desc: MonikerDescriptorKind::Namespace,
+                                    })
+                                }
+                                None => {}
                             }
                         }
                         // The only other nameless module is a *block* module: the module introduced
@@ -403,6 +422,34 @@ fn def_to_non_local_moniker(
             PackageInformation { name: name.as_str().to_owned(), repo, version }
         },
     })
+}
+
+/// The crate's own name when it differs from the name of the cargo package it belongs to, i.e. when
+/// this crate is a target of a multi-target package: a bin, an integration test, a bench, an example
+/// or `build.rs`. `None` for a package's like-named library target, so those symbols do not change.
+///
+/// The comparison is on names because that is what the crate graph carries: `add_target_crate_root`
+/// sets the display name from `cargo[tgt].name` (the target) and `CrateOrigin`'s name from
+/// `pkg_data.name` (the package). Target kind does not reach `hir::Crate`.
+///
+/// RESIDUAL, from comparing names rather than kinds: a package `foo` whose bin target is also named
+/// `foo` -- what `src/main.rs` gives you -- is indistinguishable from that package's lib target here,
+/// so a lib and a like-named bin still collide. Separating them needs the target kind carried into
+/// the crate graph, which is a wider change than this one.
+fn non_package_crate_name(db: &RootDatabase, krate: Crate) -> Option<String> {
+    let crate_name = krate.display_name(db)?.crate_name().to_string();
+    let package = match krate.origin(db) {
+        CrateOrigin::Local { name: Some(name), .. } | CrateOrigin::Library { name, .. } => name,
+        // `Local` with no package name recorded: the symbol's package field already falls back to
+        // this crate's own name, so there is nothing to distinguish it from. `Rustc` and `Lang`
+        // crates have one target each.
+        CrateOrigin::Local { name: None, .. } | CrateOrigin::Rustc { .. } | CrateOrigin::Lang(_) => {
+            return None;
+        }
+    };
+    // A package name may contain `-` where the crate name has `_`; `serde-derive` and `serde_derive`
+    // are the same target, and reporting a difference there would churn every symbol in it.
+    (crate_name != package.as_str().replace('-', "_")).then_some(crate_name)
 }
 
 /// If `module` is a block module, push a descriptor naming the item that OWNS the body the block sits

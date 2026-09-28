@@ -1320,6 +1320,96 @@ pub mod example_mod {
         );
     }
 
+    /// Two integration-test targets of ONE package, each defining `Data`. The symbol's package field
+    /// is the package name for both and nothing else named the target, so both computed
+    /// `... serde_test_suite 0.0.0 Data#`. On serde this class was 103 of 196 colliding symbols, and
+    /// `Enum#` alone covered 11 definitions in 11 test targets. Both halves are asserted, since
+    /// pinning one alone passes when it equals the string it used to collide with.
+    #[test]
+    fn same_item_in_two_test_targets_of_one_package_is_distinct_a() {
+        check_symbol(
+            r#"
+    //- /workspace/tests/test_de.rs crate:test_de package:serde_test_suite
+    struct Data$0;
+    //- /workspace/tests/test_ser.rs crate:test_ser package:serde_test_suite
+    struct Data;
+    "#,
+            "rust-analyzer cargo serde_test_suite . test_de/Data#",
+        );
+    }
+
+    #[test]
+    fn same_item_in_two_test_targets_of_one_package_is_distinct_b() {
+        check_symbol(
+            r#"
+    //- /workspace/tests/test_de.rs crate:test_de package:serde_test_suite
+    struct Data;
+    //- /workspace/tests/test_ser.rs crate:test_ser package:serde_test_suite
+    struct Data$0;
+    "#,
+            "rust-analyzer cargo serde_test_suite . test_ser/Data#",
+        );
+    }
+
+    /// `build.rs` is a target of the package too, so it is a crate whose name differs from the
+    /// package's. Before this it shared the package's whole namespace with the lib target.
+    #[test]
+    fn build_script_target_is_distinct_from_the_lib_target() {
+        check_symbol(
+            r#"
+    //- /workspace/build.rs crate:build_script_build package:mypkg
+    struct Shared$0;
+    //- /workspace/src/lib.rs crate:mypkg package:mypkg
+    struct Shared;
+    "#,
+            "rust-analyzer cargo mypkg . build_script_build/Shared#",
+        );
+    }
+
+    /// CONTROL for this half: the package's like-named LIBRARY target keeps exactly the symbol it
+    /// had, with no target namespace inserted. This is the common case -- almost every symbol in a
+    /// normal dependency -- so if it changed, the whole index would churn for nothing.
+    #[test]
+    fn lib_target_symbol_has_no_target_namespace() {
+        check_symbol(
+            r#"
+    //- /workspace/src/lib.rs crate:mypkg package:mypkg
+    pub mod m {
+       pub struct Plain$0;
+    }
+    "#,
+            "rust-analyzer cargo mypkg . m/Plain#",
+        );
+    }
+
+    /// CONTROL, the other direction: a package name spelled with `-` and a crate name with `_` are
+    /// the SAME target, not two. Comparing them raw would insert a namespace into every symbol of
+    /// every hyphenated package -- the single largest churn this change could wrongly cause.
+    #[test]
+    fn hyphenated_package_name_is_not_a_different_target() {
+        check_symbol(
+            r#"
+    //- /workspace/src/lib.rs crate:serde_derive package:serde-derive
+    pub struct Plain$0;
+    "#,
+            "rust-analyzer cargo serde-derive . Plain#",
+        );
+    }
+
+    /// The crate ROOT module of a non-lib target: the target name takes the place of `crate`, rather
+    /// than being added in front of it, because it identifies the root exactly as `crate` does and
+    /// unlike `crate` it is unique within the package.
+    #[test]
+    fn crate_root_of_a_non_lib_target_is_named_by_the_target() {
+        check_symbol(
+            r#"
+    //- /workspace/tests/test_de.rs crate:test_de package:serde_test_suite
+    pub mod inner$0 {}
+    "#,
+            "rust-analyzer cargo serde_test_suite . test_de/inner/",
+        );
+    }
+
     /// CONTROL. A module-level item must be completely unaffected: if this string changed, the
     /// descriptor change would be churning symbols it has no business touching, and the measured
     /// churn figure (serde 16.59% of definition sites) would be wrong in the other direction.
