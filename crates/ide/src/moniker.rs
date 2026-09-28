@@ -324,6 +324,11 @@ fn def_to_non_local_moniker<'db>(
     loop {
         match def {
             Definition::SelfType(impl_) => {
+                // `impl_.module(db)`, not the outer `module`, and here the two are the same thing:
+                // for a `SelfType` definition `definition.module(db)` IS the impl's module. Written
+                // out anyway so this arm and the walk's `ast::Item::Impl` arm name the same module
+                // from the same expression, because THERE the outer `module` is a different one.
+                let module = impl_.module(db);
                 if let Some(trait_ref) = impl_.trait_ref(db) {
                     // Trait impls use the trait type for the 2nd parameter.
                     reverse_description.push(MonikerDescriptor {
@@ -684,6 +689,20 @@ fn push_block_owner_descriptor<'db>(
                     Some(impl_) if named_owners.contains(&Definition::SelfType(impl_)) => break,
                     Some(impl_) => {
                         named_owners.push(Definition::SelfType(impl_));
+                        // NOT the outer `module`: that is a BLOCK module inside the method's body,
+                        // and `display` renders a path that is shortest FROM the module it is given.
+                        // A block module sees everything its parent sees PLUS its own items, so a
+                        // `use` in the body shortens the self type there and nowhere else:
+                        //
+                        //     pub mod sub { pub struct A; }
+                        //     impl crate::sub::A { pub fn m() { use crate::sub::A; struct H; } }
+                        //
+                        // gave `H` the owner `impl#[A]m().` while `m`'s own symbol is
+                        // impl#[`sub::A`]m(). -- so the fn-local item's symbol was NOT its owner's
+                        // symbol plus a descriptor, which is the one property this chain exists to
+                        // provide. Worse, two such impls whose self types shorten to the same name
+                        // made their fn-local items collide, the very failure the chain removes.
+                        let module = impl_.module(db);
                         if let Some(trait_ref) = impl_.trait_ref(db) {
                             reverse_description.push(MonikerDescriptor {
                                 name: display(db, module, trait_ref),
@@ -781,6 +800,11 @@ fn push_owner_descriptor<'db>(
     true
 }
 
+/// Renders `it` as source code, as a path valid and shortest FROM `module`.
+///
+/// The module is therefore part of the SPELLING and not just a crate selector, which is why an
+/// impl's descriptors are rendered against `impl_.module(db)` at both call sites and never against
+/// the block module a walk reached the impl from. See `push_block_owner_descriptors`.
 fn display<'db, T: HirDisplay<'db>>(db: &'db RootDatabase, module: hir::Module, it: T) -> String {
     match it.display_source_code(db, module.into(), true) {
         Ok(result) => result,

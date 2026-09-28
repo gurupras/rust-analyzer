@@ -1404,6 +1404,137 @@ pub mod example_mod {
         );
     }
 
+    /// Review finding m-C, written as a fixture BEFORE any code change so that "does it reproduce" is
+    /// answered by the suite and not by reading the renderer. The impl descriptors are rendered with
+    /// `display(db, module, ..)` where `module` is the BLOCK module, while the impl's own symbol renders
+    /// them against the item's module; a fn-local type shadowing the self type's name is the case where
+    /// those two modules could disagree. Both spellings are asserted, so a divergence fails an assertion
+    /// instead of producing two symbols nobody compared.
+    #[test]
+    fn fn_local_item_shadowing_the_self_type_spells_the_impl_like_the_method_does() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub struct A;
+    impl A {
+       pub fn m() {
+           struct A;
+           struct Helper$0;
+       }
+    }
+    "#,
+            "rust-analyzer cargo main . impl#[A]m().Helper#",
+        );
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub struct A;
+    impl A {
+       pub fn m$0() {
+           struct A;
+           struct Helper;
+       }
+    }
+    "#,
+            "rust-analyzer cargo main . impl#[A]m().",
+        );
+    }
+
+    /// m-C again, by the route shadowing cannot take, and this is the route that REPRODUCED.
+    /// `display_source_code` renders a path that is valid FROM the module it is given, and a block module
+    /// sees everything its parent sees plus its own items -- so the two modules can only disagree when a
+    /// local item changes which path is shortest. A `use` in the fn body does that and is itself an item,
+    /// so it also makes the body a block module. Before the fix this printed `impl#[A]m().Helper#` while
+    /// the next test's `m` printed impl#[`sub::A`]m(): a fn-local item whose symbol was NOT its owner's
+    /// symbol plus a descriptor. Two separate tests, not two assertions in one, because a divergence has
+    /// to print BOTH strings to be useful and the first failing assertion would hide the second.
+    #[test]
+    fn fn_local_use_shortening_the_self_types_path_spells_the_impl_as_the_method_does() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub mod sub { pub struct A; }
+    impl crate::sub::A {
+       pub fn m() {
+           use crate::sub::A;
+           struct Helper$0;
+       }
+    }
+    "#,
+            "rust-analyzer cargo main . impl#[`sub::A`]m().Helper#",
+        );
+    }
+
+    #[test]
+    fn a_method_over_a_submodule_self_type_spells_the_impl_from_its_own_module() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub mod sub { pub struct A; }
+    impl crate::sub::A {
+       pub fn m$0() {
+           use crate::sub::A;
+           struct Helper;
+       }
+    }
+    "#,
+            "rust-analyzer cargo main . impl#[`sub::A`]m().",
+        );
+    }
+
+    /// m-C's consequence, which the divergence on its own does not establish: a COLLISION between two
+    /// fn-local items, the exact failure the owner chain was added to remove. Two impls for two different
+    /// types both named `T`, each method shortening its own self type to `T` inside its own body, so
+    /// before the fix both helpers came out `impl#[T]m().H#`. Read the pair: the two strings must differ,
+    /// and each must be its own method's symbol plus `H#`.
+    #[test]
+    fn two_impls_whose_self_types_shorten_alike_keep_distinct_fn_local_items_a() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub mod a { pub struct T; }
+    pub mod b { pub struct T; }
+    impl crate::a::T {
+       pub fn m() {
+           use crate::a::T;
+           struct H$0;
+       }
+    }
+    impl crate::b::T {
+       pub fn m() {
+           use crate::b::T;
+           struct H;
+       }
+    }
+    "#,
+            "rust-analyzer cargo main . impl#[`a::T`]m().H#",
+        );
+    }
+
+    #[test]
+    fn two_impls_whose_self_types_shorten_alike_keep_distinct_fn_local_items_b() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    pub mod a { pub struct T; }
+    pub mod b { pub struct T; }
+    impl crate::a::T {
+       pub fn m() {
+           use crate::a::T;
+           struct H;
+       }
+    }
+    impl crate::b::T {
+       pub fn m() {
+           use crate::b::T;
+           struct H$0;
+       }
+    }
+    "#,
+            "rust-analyzer cargo main . impl#[`b::T`]m().H#",
+        );
+    }
+
     /// A trait impl carries the trait as well, again in the `SelfType` arm's order: `impl`, self type,
     /// trait. Two impls of two traits for ONE type would otherwise still collide.
     #[test]
