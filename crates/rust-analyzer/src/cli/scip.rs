@@ -1776,6 +1776,28 @@ pub mod example_mod {
         );
     }
 
+    /// THE SECOND ROUTE TO THE SAME DEFECT, which the `const` fixture above does not cover and which the
+    /// write-up could only call untraced: the `#[tokio::test] async fn` sites (`tokio/tests/sync_mpsc_weak.rs`,
+    /// 34 of the 326) reach two nested block modules through a STATEMENT MACRO instead of a `const`. A
+    /// `m!();` statement expands to an item inside the body, and an item is all a `{ }` needs to become a
+    /// block module -- exactly what `const C` buys above, with no `const` in the source. On the corpus it is
+    /// `pin!`. Traced by rv-ra-symid in review round 3 and pinned here on their reproducer, so the route is
+    /// named by a fixture and not only by the count that went to 0.
+    #[test]
+    fn fn_local_item_after_a_statement_macro_names_its_fn_once() {
+        check_symbol(
+            r#"
+    //- /workspace/lib.rs crate:main
+    macro_rules! m { () => {} }
+    pub fn func() {
+       m!();
+       { struct Helper$0; }
+    }
+    "#,
+            "rust-analyzer cargo main . func().Helper#",
+        );
+    }
+
     /// The other direction of the same fix, and the reason it dedupes by DEFINITION rather than by the
     /// rendered name: here the two owners are spelled identically and are two different functions, so the
     /// repetition is correct and must survive. A name-based guard would emit `f().S#` and put this item in
